@@ -1,0 +1,41 @@
+[f16_k8] random               G2_F20_rne_rne_c_last        rounds= 5 classes=1 -> PASS  (baseline tie set 124, expected-correct 0.0484)
+[f16_k8] random               G4_F26_trunc_rne_c_last      rounds=10 classes=1 -> PASS  (baseline tie set 58, expected-correct 0.0172)
+[f16_k8] random               G4_F-1_trunc_rz_c_last       rounds= 5 classes=1 -> PASS  (baseline tie set 6, expected-correct 0.3333)
+[f16_k8] random               G1_F-8_rne_rne_c_last        rounds= 3 classes=1 -> PASS  (baseline tie set 2, expected-correct 0.5)
+[f16_k8] random               G1_F5_rne_rz_c_last          rounds= 5 classes=1 -> PASS  (baseline tie set 56, expected-correct 0.0179)
+[f16_k8] random               G1_F14_trunc_rz_c_last       rounds= 6 classes=1 -> PASS  (baseline tie set 60, expected-correct 0.0167)
+[f16_k8] random               G8_F-2_rne_rz_chain          rounds= 4 classes=1 -> PASS  (baseline tie set 2, expected-correct 0.5)
+[f16_k8] random               G8_F8_trunc_rne_chain        rounds= 5 classes=1 -> PASS  (baseline tie set 58, expected-correct 0.0172)
+[f16_k8] random               G8_F3_rne_rz_c_last          rounds= 3 classes=1 -> PASS  (baseline tie set 59, expected-correct 0.0169)
+[f16_k8] random               G4_F11_trunc_rz_chain        rounds= 5 classes=1 -> PASS  (baseline tie set 242, expected-correct 0.0041)
+[f16_k8] random               G1_F27_trunc_rz_c_last       rounds= 8 classes=1 -> PASS  (baseline tie set 58, expected-correct 0.0345)
+[f16_k8] random               G4_F9_trunc_rz_chain         rounds= 4 classes=1 -> PASS  (baseline tie set 59, expected-correct 0.0169)
+[f16_k8] single-fused         G8_F31_trunc_rz_chain        rounds= 5 classes=1 -> PASS  (baseline tie set 117, expected-correct 0.0342)
+[f16_k8] sequential           G1_F8_rne_rne_chain          rounds= 9 classes=1 -> PASS  (baseline tie set 63, expected-correct 0.0159)
+[f16_k8] quirk:ftz_output     G8_F16_trunc_rne_c_last      rounds= 3 classes=1 -> FLAGGED (held-out mismatches)  (baseline tie set 115, expected-correct None)
+[f16_k8] quirk:product_flush  G8_F16_trunc_rne_c_last      rounds= 1 classes=0 -> FLAGGED (no model fits)  (baseline tie set 114, expected-correct None)
+[e4m3_k32] random               G2_F20_rne_rne_c_last        rounds= 3 classes=1 -> PASS  (baseline tie set 430, expected-correct 0.1116)
+[e4m3_k32] random               G4_F26_trunc_rne_c_last      rounds= 7 classes=1 -> PASS  (baseline tie set 517, expected-correct 0.089)
+[e4m3_k32] random               G16_F10_trunc_rz_chain       rounds= 7 classes=1 -> PASS  (baseline tie set 58, expected-correct 0.0172)
+[e4m3_k32] random               G4_F-2_trunc_rne_c_last      rounds= 4 classes=1 -> PASS  (baseline tie set 12, expected-correct 0.1667)
+[e4m3_k32] random               G16_F9_trunc_rz_c_last       rounds= 5 classes=1 -> PASS  (baseline tie set 407, expected-correct 0.0025)
+[e4m3_k32] random               G16_F0_rne_rz_c_last         rounds= 6 classes=1 -> PASS  (baseline tie set 6, expected-correct 0.1667)
+[e4m3_k32] random               G16_F1_trunc_rne_c_last      rounds= 4 classes=1 -> PASS  (baseline tie set 429, expected-correct 0.0023)
+[e4m3_k32] random               G1_F27_rne_rz_chain          rounds= 7 classes=1 -> PASS  (baseline tie set 124, expected-correct 0.0161)
+[e4m3_k32] random               G8_F8_trunc_rne_chain        rounds= 3 classes=1 -> PASS  (baseline tie set 184, expected-correct 0.0054)
+[e4m3_k32] random               G8_F3_rne_rz_c_last          rounds= 5 classes=1 -> PASS  (baseline tie set 420, expected-correct 0.0024)
+[e4m3_k32] random               G16_F12_rne_rz_chain         rounds= 2 classes=1 -> PASS  (baseline tie set 486, expected-correct 0.0021)
+[e4m3_k32] random               G2_F-1_trunc_rz_c_last       rounds= 5 classes=1 -> PASS  (baseline tie set 12, expected-correct 0.1667)
+[e4m3_k32] single-fused         G32_F31_trunc_rz_chain       rounds= 7 classes=1 -> PASS  (baseline tie set 533, expected-correct 0.0019)
+[e4m3_k32] sequential           G1_F8_rne_rne_chain          rounds= 7 classes=1 -> FAIL  (baseline tie set 190, expected-correct 0.0158)
+[e4m3_k32] quirk:ftz_output     G16_F8_rne_rz_chain          rounds= 8 classes=1 -> FLAGGED (held-out mismatches)  (baseline tie set 299, expected-correct None)
+[e4m3_k32] quirk:product_flush  G16_F8_rne_rz_chain          rounds= 2 classes=0 -> FLAGGED (no model fits)  (baseline tie set 58, expected-correct None)
+{
+  "in_family_pass": 27,
+  "in_family_total": 28,
+  "quirks_flagged": 4,
+  "quirks_total": 4,
+  "median_queries": 10,
+  "baseline_mean_expected_correct": 0.0836,
+  "seconds": 333.0
+}
