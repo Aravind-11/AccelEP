@@ -17,7 +17,7 @@ SIM_LIB := $(BUILD)/libaccel_sim.so
 SIM_SHARED := -shared -Wl,-z,defs
 endif
 
-.PHONY: all test venv bench clean simlib
+.PHONY: all test venv bench clean simlib sim-test
 
 all: $(BUILD)/libaccel_ep.so $(BUILD)/test_runtime
 
@@ -73,6 +73,12 @@ test: all
 	$(PY) tests/test_ep_reject.py
 	$(PY) tests/test_bench.py
 	$(PY) tests/test_stack_matmul.py
+
+sim-test: $(BUILD)/test_sim_kernels $(BUILD)/test_runtime $(SIM_LIB)
+	./$(BUILD)/test_sim_kernels
+	./$(BUILD)/test_runtime
+	@test -x .venv/bin/python || { echo "missing .venv. Run: python3 -m venv .venv && .venv/bin/pip install numpy tokenizers"; exit 1; }
+	PYTHONPATH=. .venv/bin/python tests/test_serve.py
 
 bench:
 	$(PY) bench/mlp_bench.py

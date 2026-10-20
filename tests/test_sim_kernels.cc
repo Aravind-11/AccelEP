@@ -201,5 +201,6 @@ int main() {
     return Fail("Sample");
   }
 
+  std::printf("kernel tests passed\n");
   return 0;
 }

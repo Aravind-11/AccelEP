@@ -39,12 +39,36 @@ The logit row stays on the device. The host receives the completion text and the
 
 Text encode and decode run in this library. They are not device kernels. `SimDevice` itself executes on the machine's CPU.
 
-```bash
-make build/test_sim_kernels && ./build/test_sim_kernels
-PYTHONPATH=. .venv/bin/python tests/test_serve.py
-```
+## Simulator tests
 
-The serve test needs the model files above. One greedy check is the chat prompt "The capital of France is". The reply contains "The capital of France is Paris."
+`make sim-test` builds the simulator and runs 37 tests. It needs the `models/` files above and a `.venv` with `numpy` and `tokenizers`. A good run prints `kernel tests passed`, `runtime tests passed`, and `serve tests passed`.
+
+`tests/test_sim_kernels.cc` has 8 tests. Each one calls a kernel directly.
+
+- Embed gathers two rows and rejects an id past the table.
+- RMSNorm matches the double-precision reference, including a row offset.
+- RoPE leaves position 0 unchanged and rotates a later position.
+- The KV-cache append writes only the new rows.
+- Attention, SiLU, and the residual add match hand values.
+- Sampling at temperature 0 is an argmax. A tie keeps the earlier id.
+
+`tests/test_runtime.cc` has 24 tests.
+
+- Known MatMul, an identity batch, broadcast hand values, and Gemm with a transposed bias.
+- A weight that stays on the device, a zero K dimension, rejected shapes, and freeing an unknown buffer.
+- Fused MatMul with `transA` and alpha, broadcast with `transB`, and a Relu that stays on the device.
+- A Gemm Relu epilogue, a rejected fused shape, and the packed GEMM counters.
+- Negative shape rejection, split product bits, and non-finite epilogue bits.
+- Residual orientation, a pre-transpose of the last two axes, and the KV table.
+- Scoped stats, live allocation ids, the recording device, and a private host copy.
+
+`tests/test_serve.py` has 5 tests. The forward and HTTP tests load SmolLM2.
+
+- Encode and decode match the `tokenizers` package on 24 strings, including bytes missing from the SmolLM2 vocabulary. The ids `[504, 3575, 282, 4649, 314, 7042, 30, 2]` decode to the same text.
+- One simulator matrix multiply matches NumPy.
+- The Python RMSNorm and RoPE helpers match their formulas.
+- Greedy chat for "The capital of France is" returns text containing "The capital of France is Paris." The host copy is the UTF-8 reply plus 4 bytes per completion id. The device copy is 4 bytes per prompt id. A one-token sample at temperature 0.8 uses the same byte rule.
+- `GET /health`, `POST /v1/chat/completions`, and `POST /v1/completions` return 200. The chat reply contains Paris.
 
 ## ONNX plugin
 
