@@ -4,6 +4,8 @@ AccelEP is an ONNX Runtime 1.31 plugin for matrix multiplies. It does not need a
 
 The same simulator can serve a small Llama. The checked model is [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct). A full-size Llama does not fit in 8 GB of RAM.
 
+You can play with it here : https://autoqa.teachx.ai/GrokBox/preview/7288/
+
 ## Serve SmolLM2
 
 Put these files in `models/`. They are not part of the git tree.
