@@ -28,7 +28,7 @@ The server listens on `127.0.0.1:8000`.
 | `POST /v1/completions` | Completes a prompt. |
 | `POST /v1/chat/completions` | Completes a chat. |
 
-The host process writes the chat string and answers HTTP. A generate call then runs on the simulator:
+The host process writes the chat string and answers HTTP. A browser only sends the message and shows the reply. A generate call then runs on the simulator:
 
 1. The prompt token ids are copied onto the device.
 2. Each forward step runs embedding, RMSNorm, RoPE, attention, SiLU, the residual adds, and the KV-cache update.
@@ -70,6 +70,55 @@ Text encode and decode run in this library. They are not device kernels. `SimDev
 - Greedy chat for "The capital of France is" returns text containing "The capital of France is Paris." The host copy is the UTF-8 reply plus 4 bytes per completion id. The device copy is 4 bytes per prompt id. A one-token sample at temperature 0.8 uses the same byte rule.
 - `GET /health`, `POST /v1/chat/completions`, and `POST /v1/completions` return 200. The chat reply contains Paris.
 
+## Checked runs
+
+These runs used the simulator on this Mac. The weight files stay in `models/` and are not committed.
+
+### SmolLM2-135M-Instruct
+
+`make sim-test` passed. It printed `kernel tests passed`, `runtime tests passed`, and `serve tests passed`.
+
+The greedy chat for "The capital of France is" returned "The capital of France is Paris." The ids were `[504, 3575, 282, 4649, 314, 7042, 30, 2]`. The completion copied 63 bytes back: 31 bytes of UTF-8 plus 32 bytes of token ids. It copied 140 bytes to the device, which is the 35 prompt ids. `GET /health` and both completion posts returned 200.
+
+The chat string for that run includes the SmolLM2 system turn from `serve/engine.py`. Encode and decode stayed in the C++ library. After each sample, the host reads the chosen id through the buffer pointer to decide whether to stop.
+
+`make test` did not run. Linking `build/libaccel_ep.so` stopped with `ld: unknown options: -z`, because that target passes `-Wl,-z,defs` to the macOS linker.
+
+### SmolLM-135M-Instruct
+
+[SmolLM-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM-135M-Instruct) also ran. Its files are in `models/SmolLM-135M-Instruct/`. The shape matches SmolLM2-135M: hidden size 576, 30 layers, 9 heads, 3 KV heads, intermediate size 1536, vocab 49152. `rope_theta` is 10000, where SmolLM2 uses 100000. Its chat template does not insert a system turn.
+
+The greedy prompt was:
+
+```text
+<|im_start|>user
+The capital of France is<|im_end|>
+<|im_start|>assistant
+```
+
+The reply was "The capital of France is Paris, the largest city in France and the capital of France. It is located in the north". That used 14 prompt tokens (56 bytes to the device), 24 completion ids, and 208 bytes copied back. The forward ran 5,275 matrix multiplies: the prefill plus one forward for each new token.
+
+Six more greedy questions used the same template and stopped at 32 tokens:
+
+| Question | Reply |
+| --- | --- |
+| What is 2 + 2? | The number 2 + 2! is a fascinating concept that has puzzled mathematicians and scientists for centuries. Here's a breakdown of the formula: |
+| Who wrote Romeo and Juliet? | The answer to this question is a bit complex, as Romeo and Juliet is a play written by William Shakespeare, but it's not a single author. However, |
+| What color is the sky on a clear day? | The sky on a clear day is indeed a beautiful and vibrant color, with hues of blue, green, and sometimes even purple. The sky is a reflection of |
+| Name the largest planet in the solar system. | The largest planet in the solar system is Jupiter, with a diameter of approximately 142,948 kilometers (88,972 miles |
+| What is the boiling point of water in Celsius? | The boiling point of water is a temperature at which the vapor pressure of a liquid is equal to the pressure of the surrounding gas. In other words, it's |
+| Say hello in one word. | What a great question! The phrase "say hello" is a universal greeting that has been used in various contexts, including greetings, introductions, and farewell |
+
+Jupiter is the direct answer. The other replies talk around the question. Each prompt was still copied to the device as token ids, and each reply came back as text plus token ids.
+
+### What the suite does not measure
+
+The kernel tests use one or two elements. The model uses head size 64, grouped-query attention, and SmolLM2's `rope_theta` of 100000. The Python RMSNorm and RoPE checks call the Python helpers. The serving path calls the C++ kernels.
+
+The Paris check looks for that word in one reply. A wrong layer can still produce it. The suite does not compare logits with an independent forward, and it does not compare one full prefill with stepping one token at a time.
+
+The loader accepts a Llama config with SiLU, no RoPE scaling, and a Hugging Face BPE tokenizer whose pretokenizer is `Digits` then `ByteLevel`, with a null normalizer and no byte fallback. `JackFram/llama-68m` has no `tokenizer.json`. `ModelCloud/tinyllama-15M-stories` sets `byte_fallback` and a non-null `unk_token`, which this loader rejects.
+
 ## ONNX plugin
 
 The plugin claims float32 MatMul, 2D Gemm, and `com.microsoft.FusedMatMul` when the shapes are static. One leading MatMul batch dimension may still be unknown when the graph is compiled. Softmax, layer norm, and every other op stay on the CPU execution provider.
@@ -99,7 +148,7 @@ make test
 
 `make venv` installs `onnxruntime==1.31.0` and `onnx==1.21.0` into `/tmp/accel-venv`. A good run prints `runtime tests passed` and `ep tests passed`. `make bench` is separate. `make clean` removes `build/`.
 
-On macOS, `make simlib` builds `build/libaccel_sim.dylib` for the Llama server. Do not reuse those Mach-O objects for a Linux plugin build. Run `make clean` first.
+On macOS, `make simlib` builds `build/libaccel_sim.dylib` for the Llama server. `make build/libaccel_ep.so` stops there with `ld: unknown options: -z`. Do not reuse those Mach-O objects for a Linux plugin build. Run `make clean` first.
 
 ## Register the plugin
 
