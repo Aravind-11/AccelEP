@@ -62,6 +62,20 @@ class RecordingDevice final : public Device {
   void Transpose(DeviceBuffer src, DeviceBuffer dst, int64_t rows, int64_t cols) override;
   void GemmEpilogue(DeviceBuffer c, int64_t m, int64_t n, float alpha, const DeviceBuffer* bias,
                     const std::vector<int64_t>& bias_shape, float beta, Activation activation) override;
+  void Embedding(DeviceBuffer ids, int64_t id_offset, DeviceBuffer table, DeviceBuffer out, int64_t seq, int64_t hidden,
+                 int64_t vocab) override;
+  void RmsNorm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer y, int64_t rows, int64_t dim, float eps,
+               int64_t row_offset) override;
+  void Rope(DeviceBuffer states, DeviceBuffer cos_table, DeviceBuffer sin_table, int64_t seq, int64_t n_heads,
+            int64_t head_dim, int64_t position) override;
+  void AppendCache(DeviceBuffer src, DeviceBuffer cache, int64_t seq, int64_t position, int64_t n_heads,
+                   int64_t head_dim) override;
+  void Attention(DeviceBuffer q, DeviceBuffer k, DeviceBuffer v, DeviceBuffer scores, DeviceBuffer out, int64_t seq,
+                 int64_t position, int64_t heads, int64_t kv_heads, int64_t head_dim) override;
+  void SiluMul(DeviceBuffer gate, DeviceBuffer up, int64_t count) override;
+  void ResidualAdd(DeviceBuffer dest, DeviceBuffer extra, int64_t count) override;
+  void SampleToken(DeviceBuffer logits, DeviceBuffer chosen_ids, int64_t chosen_index, int64_t vocab, float temperature,
+                   uint32_t* rng_state) override;
 
   const std::vector<TraceOp>& Trace() const { return trace_; }
   bool Replay(Device& target) const;

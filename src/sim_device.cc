@@ -1,5 +1,13 @@
 #include "accel/device.h"
 #include "accel/runtime.h"
+#include "accel/sim_add.h"
+#include "accel/sim_attend.h"
+#include "accel/sim_cache.h"
+#include "accel/sim_embed.h"
+#include "accel/sim_rmsnorm.h"
+#include "accel/sim_rope.h"
+#include "accel/sim_sample.h"
+#include "accel/sim_silu.h"
 
 #include <algorithm>
 #include <atomic>
@@ -40,6 +48,47 @@ size_t CheckedBytes(int64_t rows, int64_t cols) {
     throw std::overflow_error("matrix is too large");
   }
   return static_cast<size_t>(rows) * static_cast<size_t>(cols) * sizeof(float);
+}
+
+int64_t CheckedSpan(int64_t offset, int64_t count) {
+  if (offset < 0 || count < 0) {
+    throw std::invalid_argument("negative matrix dimension");
+  }
+  if (offset > INT64_MAX - count) {
+    throw std::overflow_error("matrix is too large");
+  }
+  return offset + count;
+}
+
+size_t CheckedFloats(int64_t depth, int64_t rows, int64_t cols) {
+  if (depth < 0 || rows < 0 || cols < 0) {
+    throw std::invalid_argument("negative matrix dimension");
+  }
+  if (depth == 0 || rows == 0 || cols == 0) {
+    return 0;
+  }
+  if (static_cast<uint64_t>(rows) > UINT64_MAX / static_cast<uint64_t>(depth)) {
+    throw std::overflow_error("matrix is too large");
+  }
+  const uint64_t plane = static_cast<uint64_t>(depth) * static_cast<uint64_t>(rows);
+  if (static_cast<uint64_t>(cols) > UINT64_MAX / plane) {
+    throw std::overflow_error("matrix is too large");
+  }
+  const uint64_t count = plane * static_cast<uint64_t>(cols);
+  if (count > UINT64_MAX / sizeof(float)) {
+    throw std::overflow_error("matrix is too large");
+  }
+  return static_cast<size_t>(count * sizeof(float));
+}
+
+size_t CheckedIntBytes(int64_t count) {
+  if (count < 0) {
+    throw std::invalid_argument("negative matrix dimension");
+  }
+  if (count != 0 && static_cast<uint64_t>(count) > UINT64_MAX / sizeof(int32_t)) {
+    throw std::overflow_error("matrix is too large");
+  }
+  return static_cast<size_t>(count) * sizeof(int32_t);
 }
 
 void RequireBytes(const DeviceBuffer& buffer, size_t need, const char* what) {
@@ -192,6 +241,89 @@ class SimDevice final : public Device {
         out[i * n + j] = value;
       }
     }
+  }
+
+  void Embedding(DeviceBuffer ids, int64_t id_offset, DeviceBuffer table, DeviceBuffer out, int64_t seq, int64_t hidden,
+                 int64_t vocab) override {
+    const int64_t id_count = CheckedSpan(id_offset, seq);
+    RequireBytes(ids, CheckedIntBytes(id_count), "Embedding ids are out of range");
+    RequireBytes(table, CheckedBytes(vocab, hidden), "Embedding table is out of range");
+    RequireBytes(out, CheckedBytes(seq, hidden), "Embedding output is out of range");
+    SimEmbed(static_cast<const int32_t*>(ids.data), id_offset, static_cast<const float*>(table.data),
+             static_cast<float*>(out.data), seq, hidden, vocab);
+  }
+
+  void RmsNorm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer y, int64_t rows, int64_t dim, float eps,
+               int64_t row_offset) override {
+    const int64_t x_rows = CheckedSpan(row_offset, rows);
+    RequireBytes(x, CheckedBytes(x_rows, dim), "RmsNorm input is out of range");
+    RequireBytes(weight, CheckedBytes(dim, 1), "RmsNorm weight is out of range");
+    RequireBytes(y, CheckedBytes(rows, dim), "RmsNorm output is out of range");
+    SimRmsNorm(static_cast<const float*>(x.data), static_cast<const float*>(weight.data), static_cast<float*>(y.data),
+               rows, dim, eps, row_offset);
+  }
+
+  void Rope(DeviceBuffer states, DeviceBuffer cos_table, DeviceBuffer sin_table, int64_t seq, int64_t n_heads,
+            int64_t head_dim, int64_t position) override {
+    const int64_t positions = CheckedSpan(position, seq);
+    RequireBytes(states, CheckedFloats(seq, n_heads, head_dim), "Rope states are out of range");
+    RequireBytes(cos_table, CheckedBytes(positions, head_dim), "Rope cos table is out of range");
+    RequireBytes(sin_table, CheckedBytes(positions, head_dim), "Rope sin table is out of range");
+    SimRope(static_cast<float*>(states.data), static_cast<const float*>(cos_table.data),
+            static_cast<const float*>(sin_table.data), seq, n_heads, head_dim, position);
+  }
+
+  void AppendCache(DeviceBuffer src, DeviceBuffer cache, int64_t seq, int64_t position, int64_t n_heads,
+                   int64_t head_dim) override {
+    const int64_t rows = CheckedSpan(position, seq);
+    RequireBytes(src, CheckedFloats(seq, n_heads, head_dim), "AppendCache source is out of range");
+    RequireBytes(cache, CheckedFloats(rows, n_heads, head_dim), "AppendCache cache is out of range");
+    SimAppendCache(static_cast<const float*>(src.data), static_cast<float*>(cache.data), seq, position, n_heads,
+                   head_dim);
+  }
+
+  void Attention(DeviceBuffer q, DeviceBuffer k, DeviceBuffer v, DeviceBuffer scores, DeviceBuffer out, int64_t seq,
+                 int64_t position, int64_t heads, int64_t kv_heads, int64_t head_dim) override {
+    if (kv_heads <= 0 || (heads > 0 && heads % kv_heads != 0)) {
+      throw std::invalid_argument("Attention kv heads are out of range");
+    }
+    const int64_t seen = CheckedSpan(position, seq);
+    RequireBytes(q, CheckedFloats(seq, heads, head_dim), "Attention query is out of range");
+    RequireBytes(k, CheckedFloats(seen, kv_heads, head_dim), "Attention key is out of range");
+    RequireBytes(v, CheckedFloats(seen, kv_heads, head_dim), "Attention value is out of range");
+    RequireBytes(scores, CheckedBytes(seen, 1), "Attention scores are out of range");
+    RequireBytes(out, CheckedFloats(seq, heads, head_dim), "Attention output is out of range");
+    SimAttend(static_cast<const float*>(q.data), static_cast<const float*>(k.data), static_cast<const float*>(v.data),
+              static_cast<float*>(scores.data), static_cast<float*>(out.data), seq, position, heads, kv_heads,
+              head_dim);
+  }
+
+  void SiluMul(DeviceBuffer gate, DeviceBuffer up, int64_t count) override {
+    const size_t bytes = CheckedBytes(count, 1);
+    RequireBytes(gate, bytes, "SiluMul gate is out of range");
+    RequireBytes(up, bytes, "SiluMul up is out of range");
+    SimSiluMul(static_cast<float*>(gate.data), static_cast<const float*>(up.data), count);
+  }
+
+  void ResidualAdd(DeviceBuffer dest, DeviceBuffer extra, int64_t count) override {
+    const size_t bytes = CheckedBytes(count, 1);
+    RequireBytes(dest, bytes, "ResidualAdd destination is out of range");
+    RequireBytes(extra, bytes, "ResidualAdd extra is out of range");
+    SimAdd(static_cast<float*>(dest.data), static_cast<const float*>(extra.data), count);
+  }
+
+  void SampleToken(DeviceBuffer logits, DeviceBuffer chosen_ids, int64_t chosen_index, int64_t vocab,
+                   float temperature, uint32_t* rng_state) override {
+    if (vocab <= 0 || chosen_index < 0) {
+      throw std::invalid_argument("SampleToken is out of range");
+    }
+    if (rng_state == nullptr) {
+      throw std::invalid_argument("SampleToken rng is out of range");
+    }
+    RequireBytes(logits, CheckedBytes(vocab, 1), "SampleToken logits are out of range");
+    RequireBytes(chosen_ids, CheckedIntBytes(CheckedSpan(chosen_index, 1)), "SampleToken ids are out of range");
+    SimSampleToken(static_cast<const float*>(logits.data), static_cast<int32_t*>(chosen_ids.data), chosen_index, vocab,
+                   temperature, rng_state);
   }
 
  private:

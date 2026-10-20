@@ -90,6 +90,36 @@ class Device {
   virtual void GemmEpilogue(DeviceBuffer c, int64_t m, int64_t n, float alpha, const DeviceBuffer* bias,
                             const std::vector<int64_t>& bias_shape, float beta,
                             Activation activation = Activation::None) = 0;
+
+  // ids are int32. out[s, :] = table[ids[id_offset + s], :] with table [vocab, hidden].
+  virtual void Embedding(DeviceBuffer ids, int64_t id_offset, DeviceBuffer table, DeviceBuffer out, int64_t seq,
+                         int64_t hidden, int64_t vocab) = 0;
+
+  // y[row, :] = rms_norm(x[row_offset + row, :]). weight has `dim` floats.
+  virtual void RmsNorm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer y, int64_t rows, int64_t dim, float eps,
+                       int64_t row_offset) = 0;
+
+  // In-place rotary embedding. cos and sin rows are head_dim wide at absolute positions.
+  virtual void Rope(DeviceBuffer states, DeviceBuffer cos_table, DeviceBuffer sin_table, int64_t seq, int64_t n_heads,
+                    int64_t head_dim, int64_t position) = 0;
+
+  // Copy `seq` rows of n_heads * head_dim floats into cache starting at `position`.
+  virtual void AppendCache(DeviceBuffer src, DeviceBuffer cache, int64_t seq, int64_t position, int64_t n_heads,
+                           int64_t head_dim) = 0;
+
+  // Causal attention. k and v already hold rows [0, position + seq). scores is scratch.
+  virtual void Attention(DeviceBuffer q, DeviceBuffer k, DeviceBuffer v, DeviceBuffer scores, DeviceBuffer out,
+                         int64_t seq, int64_t position, int64_t heads, int64_t kv_heads, int64_t head_dim) = 0;
+
+  // gate[i] = silu(gate[i]) * up[i].
+  virtual void SiluMul(DeviceBuffer gate, DeviceBuffer up, int64_t count) = 0;
+
+  // dest[i] += extra[i].
+  virtual void ResidualAdd(DeviceBuffer dest, DeviceBuffer extra, int64_t count) = 0;
+
+  // Writes one int32 to chosen_ids[chosen_index]. temperature <= 0 is argmax.
+  virtual void SampleToken(DeviceBuffer logits, DeviceBuffer chosen_ids, int64_t chosen_index, int64_t vocab,
+                           float temperature, uint32_t* rng_state) = 0;
 };
 
 std::unique_ptr<Device> CreateSimDevice();

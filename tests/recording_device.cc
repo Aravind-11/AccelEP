@@ -149,6 +149,134 @@ void RecordingDevice::GemmEpilogue(DeviceBuffer c, int64_t m, int64_t n, float a
   tapes_.emplace_back();
 }
 
+void RecordingDevice::Embedding(DeviceBuffer ids, int64_t id_offset, DeviceBuffer table, DeviceBuffer out, int64_t seq,
+                                int64_t hidden, int64_t vocab) {
+  inner_.Embedding(ids, id_offset, table, out, seq, hidden, vocab);
+  TraceOp op;
+  op.op = "Embedding";
+  op.a = Cover(ids);
+  op.b = Cover(table);
+  op.c = Cover(out);
+  op.rows = id_offset;
+  op.m = seq;
+  op.k = hidden;
+  op.n = vocab;
+  op.c_hash = Peek(out);
+  trace_.push_back(op);
+  tapes_.emplace_back();
+}
+
+void RecordingDevice::RmsNorm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer y, int64_t rows, int64_t dim, float eps,
+                              int64_t row_offset) {
+  inner_.RmsNorm(x, weight, y, rows, dim, eps, row_offset);
+  TraceOp op;
+  op.op = "RmsNorm";
+  op.a = Cover(x);
+  op.b = Cover(weight);
+  op.c = Cover(y);
+  op.rows = rows;
+  op.cols = dim;
+  op.m = row_offset;
+  op.alpha = eps;
+  op.c_hash = Peek(y);
+  trace_.push_back(op);
+  tapes_.emplace_back();
+}
+
+void RecordingDevice::Rope(DeviceBuffer states, DeviceBuffer cos_table, DeviceBuffer sin_table, int64_t seq,
+                           int64_t n_heads, int64_t head_dim, int64_t position) {
+  inner_.Rope(states, cos_table, sin_table, seq, n_heads, head_dim, position);
+  TraceOp op;
+  op.op = "Rope";
+  op.a = Cover(states);
+  op.b = Cover(cos_table);
+  op.c = Cover(sin_table);
+  op.m = seq;
+  op.k = n_heads;
+  op.n = head_dim;
+  op.rows = position;
+  op.a_hash = Peek(states);
+  trace_.push_back(op);
+  tapes_.emplace_back();
+}
+
+void RecordingDevice::AppendCache(DeviceBuffer src, DeviceBuffer cache, int64_t seq, int64_t position, int64_t n_heads,
+                                  int64_t head_dim) {
+  inner_.AppendCache(src, cache, seq, position, n_heads, head_dim);
+  TraceOp op;
+  op.op = "AppendCache";
+  op.src = Cover(src);
+  op.dst = Cover(cache);
+  op.m = seq;
+  op.k = position;
+  op.n = n_heads;
+  op.rows = head_dim;
+  op.dst_hash = Peek(cache);
+  trace_.push_back(op);
+  tapes_.emplace_back();
+}
+
+void RecordingDevice::Attention(DeviceBuffer q, DeviceBuffer k, DeviceBuffer v, DeviceBuffer scores, DeviceBuffer out,
+                                int64_t seq, int64_t position, int64_t heads, int64_t kv_heads, int64_t head_dim) {
+  inner_.Attention(q, k, v, scores, out, seq, position, heads, kv_heads, head_dim);
+  TraceOp op;
+  op.op = "Attention";
+  op.a = Cover(q);
+  op.b = Cover(k);
+  op.c = Cover(v);
+  op.src = Cover(scores);
+  op.dst = Cover(out);
+  op.m = seq;
+  op.k = position;
+  op.n = heads;
+  op.rows = kv_heads;
+  op.cols = head_dim;
+  op.dst_hash = Peek(out);
+  trace_.push_back(op);
+  tapes_.emplace_back();
+}
+
+void RecordingDevice::SiluMul(DeviceBuffer gate, DeviceBuffer up, int64_t count) {
+  inner_.SiluMul(gate, up, count);
+  TraceOp op;
+  op.op = "SiluMul";
+  op.a = Cover(gate);
+  op.b = Cover(up);
+  op.m = count;
+  op.a_hash = Peek(gate);
+  trace_.push_back(op);
+  tapes_.emplace_back();
+}
+
+void RecordingDevice::ResidualAdd(DeviceBuffer dest, DeviceBuffer extra, int64_t count) {
+  inner_.ResidualAdd(dest, extra, count);
+  TraceOp op;
+  op.op = "ResidualAdd";
+  op.a = Cover(dest);
+  op.b = Cover(extra);
+  op.m = count;
+  op.a_hash = Peek(dest);
+  trace_.push_back(op);
+  tapes_.emplace_back();
+}
+
+void RecordingDevice::SampleToken(DeviceBuffer logits, DeviceBuffer chosen_ids, int64_t chosen_index, int64_t vocab,
+                                  float temperature, uint32_t* rng_state) {
+  const uint32_t rng_before = rng_state == nullptr ? 0u : *rng_state;
+  inner_.SampleToken(logits, chosen_ids, chosen_index, vocab, temperature, rng_state);
+  TraceOp op;
+  op.op = "SampleToken";
+  op.a = Cover(logits);
+  op.dst = Cover(chosen_ids);
+  op.m = chosen_index;
+  op.n = vocab;
+  op.alpha = temperature;
+  op.hash = rng_before;
+  op.dst_hash = Peek(chosen_ids);
+  trace_.push_back(op);
+  tapes_.emplace_back();
+}
+
 SliceRef RecordingDevice::Cover(DeviceBuffer buffer) const {
   const auto ptr = reinterpret_cast<uintptr_t>(buffer.data);
   for (const Live& live : live_) {
@@ -172,6 +300,21 @@ uint64_t RecordingDevice::Peek(DeviceBuffer buffer) const {
 bool RecordingDevice::Replay(Device& target) const {
   try {
     std::unordered_map<uint64_t, DeviceBuffer> allocs;
+    auto placed = [&](const SliceRef& ref, DeviceBuffer* out) -> bool {
+      auto found = allocs.find(ref.id);
+      if (found == allocs.end()) {
+        return false;
+      }
+      *out = Placed(found->second, ref);
+      return true;
+    };
+    auto same = [&](DeviceBuffer buf, uint64_t expect) -> bool {
+      std::vector<unsigned char> tmp(buf.bytes);
+      if (!tmp.empty()) {
+        target.CopyDeviceToHost(tmp.data(), buf, tmp.size());
+      }
+      return Fnv1a64(tmp.empty() ? nullptr : tmp.data(), tmp.size()) == expect;
+    };
     for (size_t index = 0; index < trace_.size(); ++index) {
       const TraceOp& op = trace_[index];
       if (op.op == "Allocate") {
@@ -264,6 +407,94 @@ bool RecordingDevice::Replay(Device& target) const {
           target.CopyDeviceToHost(tmp.data(), c_buf, tmp.size());
         }
         if (Fnv1a64(tmp.empty() ? nullptr : tmp.data(), tmp.size()) != op.hash_after) {
+          return false;
+        }
+      } else if (op.op == "Embedding") {
+        DeviceBuffer ids;
+        DeviceBuffer table;
+        DeviceBuffer out;
+        if (!placed(op.a, &ids) || !placed(op.b, &table) || !placed(op.c, &out)) {
+          return false;
+        }
+        target.Embedding(ids, op.rows, table, out, op.m, op.k, op.n);
+        if (!same(out, op.c_hash)) {
+          return false;
+        }
+      } else if (op.op == "RmsNorm") {
+        DeviceBuffer x;
+        DeviceBuffer weight;
+        DeviceBuffer y;
+        if (!placed(op.a, &x) || !placed(op.b, &weight) || !placed(op.c, &y)) {
+          return false;
+        }
+        target.RmsNorm(x, weight, y, op.rows, op.cols, op.alpha, op.m);
+        if (!same(y, op.c_hash)) {
+          return false;
+        }
+      } else if (op.op == "Rope") {
+        DeviceBuffer states;
+        DeviceBuffer cos_table;
+        DeviceBuffer sin_table;
+        if (!placed(op.a, &states) || !placed(op.b, &cos_table) || !placed(op.c, &sin_table)) {
+          return false;
+        }
+        target.Rope(states, cos_table, sin_table, op.m, op.k, op.n, op.rows);
+        if (!same(states, op.a_hash)) {
+          return false;
+        }
+      } else if (op.op == "AppendCache") {
+        DeviceBuffer src;
+        DeviceBuffer cache;
+        if (!placed(op.src, &src) || !placed(op.dst, &cache)) {
+          return false;
+        }
+        target.AppendCache(src, cache, op.m, op.k, op.n, op.rows);
+        if (!same(cache, op.dst_hash)) {
+          return false;
+        }
+      } else if (op.op == "Attention") {
+        DeviceBuffer q;
+        DeviceBuffer k;
+        DeviceBuffer v;
+        DeviceBuffer scores;
+        DeviceBuffer out;
+        if (!placed(op.a, &q) || !placed(op.b, &k) || !placed(op.c, &v) || !placed(op.src, &scores) ||
+            !placed(op.dst, &out)) {
+          return false;
+        }
+        target.Attention(q, k, v, scores, out, op.m, op.k, op.n, op.rows, op.cols);
+        if (!same(out, op.dst_hash)) {
+          return false;
+        }
+      } else if (op.op == "SiluMul") {
+        DeviceBuffer gate;
+        DeviceBuffer up;
+        if (!placed(op.a, &gate) || !placed(op.b, &up)) {
+          return false;
+        }
+        target.SiluMul(gate, up, op.m);
+        if (!same(gate, op.a_hash)) {
+          return false;
+        }
+      } else if (op.op == "ResidualAdd") {
+        DeviceBuffer dest;
+        DeviceBuffer extra;
+        if (!placed(op.a, &dest) || !placed(op.b, &extra)) {
+          return false;
+        }
+        target.ResidualAdd(dest, extra, op.m);
+        if (!same(dest, op.a_hash)) {
+          return false;
+        }
+      } else if (op.op == "SampleToken") {
+        DeviceBuffer logits;
+        DeviceBuffer chosen;
+        if (!placed(op.a, &logits) || !placed(op.dst, &chosen)) {
+          return false;
+        }
+        uint32_t rng = static_cast<uint32_t>(op.hash);
+        target.SampleToken(logits, chosen, op.m, op.n, op.alpha, &rng);
+        if (!same(chosen, op.dst_hash)) {
           return false;
         }
       } else {
