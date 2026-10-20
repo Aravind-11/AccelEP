@@ -11,8 +11,8 @@ namespace {
 struct Stats {
   std::atomic<int64_t> matmul_ops{0};
   std::atomic<int64_t> gemm_ops{0};
-  std::atomic<int64_t> fused_matmul_ops{0};
   std::atomic<int64_t> kernel_matmuls{0};
+  std::atomic<int64_t> relu_epilogues{0};
   std::atomic<int64_t> bytes_to_device{0};
   std::atomic<int64_t> bytes_to_host{0};
 };
@@ -123,14 +123,22 @@ void GemmDims(const std::vector<int64_t>& a, bool trans_a, const std::vector<int
   *n = trans_b ? b[0] : b[1];
 }
 
+bool SwapLastTwo(std::vector<int64_t>* shape) {
+  if (shape == nullptr || shape->size() < 2) {
+    return false;
+  }
+  std::swap((*shape)[shape->size() - 2], shape->back());
+  return true;
+}
+
 }  // namespace
 
 void ResetAcceleratorStats() {
   Stats& stats = GlobalStats();
   stats.matmul_ops.store(0);
   stats.gemm_ops.store(0);
-  stats.fused_matmul_ops.store(0);
   stats.kernel_matmuls.store(0);
+  stats.relu_epilogues.store(0);
   stats.bytes_to_device.store(0);
   stats.bytes_to_host.store(0);
 }
@@ -140,8 +148,8 @@ AcceleratorStats GetAcceleratorStats() {
   AcceleratorStats out;
   out.matmul_ops = stats.matmul_ops.load();
   out.gemm_ops = stats.gemm_ops.load();
-  out.fused_matmul_ops = stats.fused_matmul_ops.load();
   out.kernel_matmuls = stats.kernel_matmuls.load();
+  out.relu_epilogues = stats.relu_epilogues.load();
   out.bytes_to_device = stats.bytes_to_device.load();
   out.bytes_to_host = stats.bytes_to_host.load();
   return out;
@@ -149,8 +157,8 @@ AcceleratorStats GetAcceleratorStats() {
 
 void NoteMatmulOp() { GlobalStats().matmul_ops.fetch_add(1); }
 void NoteGemmOp() { GlobalStats().gemm_ops.fetch_add(1); }
-void NoteFusedMatmulOp() { GlobalStats().fused_matmul_ops.fetch_add(1); }
 void NoteKernelMatmul() { GlobalStats().kernel_matmuls.fetch_add(1); }
+void NoteReluEpilogue() { GlobalStats().relu_epilogues.fetch_add(1); }
 void NoteBytesToDevice(size_t bytes) {
   GlobalStats().bytes_to_device.fetch_add(static_cast<int64_t>(bytes));
 }
@@ -198,6 +206,19 @@ bool InferMatMulShape(const std::vector<int64_t>& a, const std::vector<int64_t>&
   return true;
 }
 
+bool InferFusedMatMulShape(const std::vector<int64_t>& a, bool trans_a, const std::vector<int64_t>& b,
+                           bool trans_b, std::vector<int64_t>* out) {
+  std::vector<int64_t> a_logical = a;
+  std::vector<int64_t> b_logical = b;
+  if (trans_a && !SwapLastTwo(&a_logical)) {
+    return false;
+  }
+  if (trans_b && !SwapLastTwo(&b_logical)) {
+    return false;
+  }
+  return InferMatMulShape(a_logical, b_logical, out);
+}
+
 bool InferGemmShape(const std::vector<int64_t>& a, bool trans_a, const std::vector<int64_t>& b, bool trans_b,
                     const std::vector<int64_t>* bias, std::vector<int64_t>* out) {
   if (out == nullptr || a.size() != 2 || b.size() != 2) {
@@ -223,22 +244,6 @@ bool InferGemmShape(const std::vector<int64_t>& a, bool trans_a, const std::vect
   return true;
 }
 
-bool InferFusedMatMulShape(const std::vector<int64_t>& a, bool trans_a, const std::vector<int64_t>& b, bool trans_b,
-                           std::vector<int64_t>* out) {
-  if (out == nullptr || a.size() < 2 || b.size() < 2) {
-    return false;
-  }
-  std::vector<int64_t> a_logical = a;
-  std::vector<int64_t> b_logical = b;
-  if (trans_a) {
-    std::swap(a_logical[a_logical.size() - 2], a_logical.back());
-  }
-  if (trans_b) {
-    std::swap(b_logical[b_logical.size() - 2], b_logical.back());
-  }
-  return InferMatMulShape(a_logical, b_logical, out);
-}
-
 OwnedBuffer Upload(Device& device, const float* data, const std::vector<int64_t>& shape) {
   const int64_t count = ElementCount(shape);
   if (count > 0 && data == nullptr) {
@@ -254,14 +259,19 @@ OwnedBuffer Upload(Device& device, const float* data, const std::vector<int64_t>
   return owned;
 }
 
-void ExecuteMatMul(Device& device, const Operand& a, const Operand& b, float* out_host) {
+void ExecuteFusedMatMul(Device& device, const Operand& a, const Operand& b, const FusedMatMulConfig& config,
+                        bool relu, float* out_host) {
   std::vector<int64_t> out_shape;
-  if (!InferMatMulShape(a.shape, b.shape, &out_shape)) {
-    throw std::invalid_argument("MatMul shapes are not supported");
+  if (!InferFusedMatMulShape(a.shape, config.trans_a, b.shape, config.trans_b, &out_shape)) {
+    throw std::invalid_argument("FusedMatMul shapes are not supported");
   }
-  const int64_t m = a.shape[a.shape.size() - 2];
-  const int64_t k = a.shape.back();
-  const int64_t n = b.shape.back();
+  const int64_t a_rows = a.shape[a.shape.size() - 2];
+  const int64_t a_cols = a.shape.back();
+  const int64_t b_rows = b.shape[b.shape.size() - 2];
+  const int64_t b_cols = b.shape.back();
+  const int64_t m = config.trans_a ? a_cols : a_rows;
+  const int64_t k = config.trans_a ? a_rows : a_cols;
+  const int64_t n = config.trans_b ? b_rows : b_cols;
   const std::vector<int64_t> a_batch(a.shape.begin(), a.shape.end() - 2);
   const std::vector<int64_t> b_batch(b.shape.begin(), b.shape.end() - 2);
   const std::vector<int64_t> out_batch(out_shape.begin(), out_shape.end() - 2);
@@ -272,32 +282,66 @@ void ExecuteMatMul(Device& device, const Operand& a, const Operand& b, float* ou
   const DeviceBuffer b_buf = Resolve(device, b, &b_upload);
   const int64_t out_count = ElementCount(out_shape);
   if (out_count > 0 && out_host == nullptr) {
-    throw std::invalid_argument("missing MatMul output");
+    throw std::invalid_argument("missing FusedMatMul output");
   }
   OwnedBuffer out;
   out.device = &device;
   out.shape = out_shape;
   out.buffer = device.Allocate(static_cast<size_t>(out_count) * sizeof(float));
 
+  OwnedBuffer a_transposed;
+  OwnedBuffer b_transposed;
+  if (config.trans_a) {
+    a_transposed.device = &device;
+    a_transposed.shape = {m, k};
+    a_transposed.buffer = device.Allocate(static_cast<size_t>(ElementCount(a_transposed.shape)) * sizeof(float));
+  }
+  if (config.trans_b) {
+    b_transposed.device = &device;
+    b_transposed.shape = {k, n};
+    b_transposed.buffer = device.Allocate(static_cast<size_t>(ElementCount(b_transposed.shape)) * sizeof(float));
+  }
+
   const int64_t batches = out_batch.empty() ? 1 : ElementCount(out_batch);
   std::vector<int64_t> index(out_batch.size(), 0);
   for (int64_t batch = 0; batch < batches; ++batch) {
-    const int64_t a_off = BatchOffset(a_batch, index) * m * k;
-    const int64_t b_off = BatchOffset(b_batch, index) * k * n;
+    const int64_t a_off = BatchOffset(a_batch, index) * a_rows * a_cols;
+    const int64_t b_off = BatchOffset(b_batch, index) * b_rows * b_cols;
     const int64_t c_off = batch * m * n;
-    device.MatMul(Slice(a_buf, a_off, m * k), Slice(b_buf, b_off, k * n), Slice(out.buffer, c_off, m * n), m, k, n);
+    DeviceBuffer a_mat = Slice(a_buf, a_off, a_rows * a_cols);
+    DeviceBuffer b_mat = Slice(b_buf, b_off, b_rows * b_cols);
+    if (config.trans_a) {
+      device.Transpose(a_mat, a_transposed.buffer, a_rows, a_cols);
+      a_mat = a_transposed.buffer;
+    }
+    if (config.trans_b) {
+      device.Transpose(b_mat, b_transposed.buffer, b_rows, b_cols);
+      b_mat = b_transposed.buffer;
+    }
+    device.MatMul(a_mat, b_mat, Slice(out.buffer, c_off, m * n), m, k, n);
     if (batch + 1 < batches) {
       NextIndex(&index, out_batch);
     }
   }
+  // Scale and Relu stay on the product. The pre-activation is not copied back.
+  if (out_count > 0 && (config.alpha != 1.f || relu)) {
+    device.GemmEpilogue(out.buffer, out_count, 1, config.alpha, nullptr, {}, 0.f, relu);
+  }
   if (out_count > 0) {
     device.CopyDeviceToHost(out_host, out.buffer, static_cast<size_t>(out_count) * sizeof(float));
+  }
+  if (relu) {
+    NoteReluEpilogue();
   }
   NoteMatmulOp();
 }
 
+void ExecuteMatMul(Device& device, const Operand& a, const Operand& b, float* out_host, bool relu) {
+  ExecuteFusedMatMul(device, a, b, {}, relu, out_host);
+}
+
 void ExecuteGemm(Device& device, const Operand& a, const Operand& b, const Operand* bias,
-                 const GemmConfig& config, float* out_host) {
+                 const GemmConfig& config, float* out_host, bool relu) {
   std::vector<int64_t> out_shape;
   const std::vector<int64_t>* bias_shape = bias == nullptr ? nullptr : &bias->shape;
   if (!InferGemmShape(a.shape, config.trans_a, b.shape, config.trans_b, bias_shape, &out_shape)) {
@@ -343,7 +387,7 @@ void ExecuteGemm(Device& device, const Operand& a, const Operand& b, const Opera
   device.MatMul(a_mat, b_mat, out.buffer, m, k, n);
 
   const bool scale = config.alpha != 1.f;
-  if (bias != nullptr || scale) {
+  if (bias != nullptr || scale || relu) {
     DeviceBuffer bias_buf{};
     const DeviceBuffer* bias_ptr = nullptr;
     if (bias != nullptr) {
@@ -351,85 +395,15 @@ void ExecuteGemm(Device& device, const Operand& a, const Operand& b, const Opera
       bias_ptr = &bias_buf;
     }
     device.GemmEpilogue(out.buffer, m, n, config.alpha, bias_ptr, bias == nullptr ? std::vector<int64_t>{} : bias->shape,
-                        config.beta);
+                        config.beta, relu);
   }
   if (out_count > 0) {
     device.CopyDeviceToHost(out_host, out.buffer, static_cast<size_t>(out_count) * sizeof(float));
+  }
+  if (relu) {
+    NoteReluEpilogue();
   }
   NoteGemmOp();
-}
-
-void ExecuteFusedMatMul(Device& device, const Operand& a, const Operand& b, const GemmConfig& config,
-                        float* out_host) {
-  std::vector<int64_t> out_shape;
-  if (!InferFusedMatMulShape(a.shape, config.trans_a, b.shape, config.trans_b, &out_shape)) {
-    throw std::invalid_argument("FusedMatMul shapes are not supported");
-  }
-  const int64_t a_rows = a.shape[a.shape.size() - 2];
-  const int64_t a_cols = a.shape.back();
-  const int64_t b_rows = b.shape[b.shape.size() - 2];
-  const int64_t b_cols = b.shape.back();
-  const int64_t m = config.trans_a ? a_cols : a_rows;
-  const int64_t k = config.trans_a ? a_rows : a_cols;
-  const int64_t n = config.trans_b ? b_rows : b_cols;
-  const std::vector<int64_t> a_batch(a.shape.begin(), a.shape.end() - 2);
-  const std::vector<int64_t> b_batch(b.shape.begin(), b.shape.end() - 2);
-  const std::vector<int64_t> out_batch(out_shape.begin(), out_shape.end() - 2);
-
-  OwnedBuffer a_upload;
-  OwnedBuffer b_upload;
-  OwnedBuffer a_transposed;
-  OwnedBuffer b_transposed;
-  const DeviceBuffer a_buf = Resolve(device, a, &a_upload);
-  const DeviceBuffer b_buf = Resolve(device, b, &b_upload);
-  if (config.trans_a) {
-    a_transposed.device = &device;
-    a_transposed.shape = {m, k};
-    a_transposed.buffer = device.Allocate(static_cast<size_t>(m * k) * sizeof(float));
-  }
-  if (config.trans_b) {
-    b_transposed.device = &device;
-    b_transposed.shape = {k, n};
-    b_transposed.buffer = device.Allocate(static_cast<size_t>(k * n) * sizeof(float));
-  }
-
-  const int64_t out_count = ElementCount(out_shape);
-  if (out_count > 0 && out_host == nullptr) {
-    throw std::invalid_argument("missing FusedMatMul output");
-  }
-  OwnedBuffer out;
-  out.device = &device;
-  out.shape = out_shape;
-  out.buffer = device.Allocate(static_cast<size_t>(out_count) * sizeof(float));
-
-  const int64_t batches = out_batch.empty() ? 1 : ElementCount(out_batch);
-  std::vector<int64_t> index(out_batch.size(), 0);
-  for (int64_t batch = 0; batch < batches; ++batch) {
-    const int64_t a_off = BatchOffset(a_batch, index) * a_rows * a_cols;
-    const int64_t b_off = BatchOffset(b_batch, index) * b_rows * b_cols;
-    const int64_t c_off = batch * m * n;
-    DeviceBuffer a_mat = Slice(a_buf, a_off, a_rows * a_cols);
-    DeviceBuffer b_mat = Slice(b_buf, b_off, b_rows * b_cols);
-    if (config.trans_a) {
-      device.Transpose(a_mat, a_transposed.buffer, a_rows, a_cols);
-      a_mat = a_transposed.buffer;
-    }
-    if (config.trans_b) {
-      device.Transpose(b_mat, b_transposed.buffer, b_rows, b_cols);
-      b_mat = b_transposed.buffer;
-    }
-    device.MatMul(a_mat, b_mat, Slice(out.buffer, c_off, m * n), m, k, n);
-    if (batch + 1 < batches) {
-      NextIndex(&index, out_batch);
-    }
-  }
-  if (out_count > 0 && config.alpha != 1.f) {
-    device.GemmEpilogue(out.buffer, out_count / n, n, config.alpha, nullptr, {}, 1.f);
-  }
-  if (out_count > 0) {
-    device.CopyDeviceToHost(out_host, out.buffer, static_cast<size_t>(out_count) * sizeof(float));
-  }
-  NoteFusedMatmulOp();
 }
 
 }  // namespace accel

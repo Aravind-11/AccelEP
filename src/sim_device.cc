@@ -144,7 +144,7 @@ class SimDevice final : public Device {
   }
 
   void GemmEpilogue(DeviceBuffer c, int64_t m, int64_t n, float alpha, const DeviceBuffer* bias,
-                    const std::vector<int64_t>& bias_shape, float beta) override {
+                    const std::vector<int64_t>& bias_shape, float beta, bool relu) override {
     RequireBytes(c, CheckedBytes(m, n), "Gemm epilogue destination is out of range");
     const bool has_bias = bias != nullptr;
     if (has_bias) {
@@ -164,6 +164,9 @@ class SimDevice final : public Device {
         float value = alpha * out[i * n + j];
         if (bias_data != nullptr) {
           value += beta * bias_data[BiasOffset(bias_shape, i, j)];
+        }
+        if (relu && value < 0.f) {
+          value = 0.f;
         }
         out[i * n + j] = value;
       }

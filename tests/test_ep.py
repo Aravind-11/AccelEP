@@ -1,4 +1,4 @@
-"""AccelEP runs MatMul, FusedMatMul, and Gemm. Every other op stays on CPU."""
+"""AccelEP runs MatMul and Gemm. Every other op stays on CPU."""
 
 import ctypes
 from pathlib import Path
@@ -12,18 +12,11 @@ LIB = Path(__file__).resolve().parents[1] / "build" / "libaccel_ep.so"
 EP_NAME = "AccelEP"
 
 
-def model(nodes, inputs, outputs, initializers):
+def model(nodes, inputs, outputs, initializers, extra_opsets=()):
     graph = helper.make_graph(nodes, "accel", inputs, outputs, initializers)
-    built = helper.make_model(graph, opset_imports=[helper.make_opsetid("", 17)])
+    opsets = [helper.make_opsetid("", 17), *extra_opsets]
+    built = helper.make_model(graph, opset_imports=opsets)
     return onnx.shape_inference.infer_shapes(built)
-
-
-def contrib_model(nodes, inputs, outputs, initializers):
-    graph = helper.make_graph(nodes, "accel", inputs, outputs, initializers)
-    return helper.make_model(
-        graph,
-        opset_imports=[helper.make_opsetid("", 17), helper.make_opsetid("com.microsoft", 1)],
-    )
 
 
 def check(name, got, want):
@@ -37,8 +30,8 @@ def main():
     for fn in (
         "AccelEpMatmulOps",
         "AccelEpGemmOps",
-        "AccelEpFusedMatmulOps",
         "AccelEpKernelMatmuls",
+        "AccelEpReluEpilogues",
         "AccelEpBytesToDevice",
         "AccelEpBytesToHost",
     ):
@@ -100,10 +93,77 @@ def main():
         [numpy_helper.from_array(gw, "W"), numpy_helper.from_array(gbias, "B")],
     )
 
+    # Default extended optimizer rewrites Transpose+MatMul into FusedMatMul.
+    tx = rng.standard_normal((4, 2)).astype(np.float32)
+    tw = rng.standard_normal((4, 3)).astype(np.float32)
+    transpose_want = tx.T @ tw
+    transpose_model = model(
+        [
+            helper.make_node("Transpose", ["X"], ["XT"], perm=[1, 0]),
+            helper.make_node("MatMul", ["XT", "W"], ["Y"]),
+        ],
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 2])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 3])],
+        [numpy_helper.from_array(tw, "W")],
+    )
+
+    fx = rng.standard_normal((2, 4)).astype(np.float32)
+    fw = rng.standard_normal((3, 4)).astype(np.float32)
+    fused_alpha = np.float32(1.5)
+    fused_want = fused_alpha * (fx @ fw.T)
+    microsoft = helper.make_opsetid("com.microsoft", 1)
+    fused_model = model(
+        [
+            helper.make_node(
+                "FusedMatMul",
+                ["X", "W"],
+                ["Y"],
+                domain="com.microsoft",
+                transB=1,
+                alpha=float(fused_alpha),
+            )
+        ],
+        [helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 4])],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 3])],
+        [numpy_helper.from_array(fw, "W")],
+        extra_opsets=(microsoft,),
+    )
+
+    # transBatchA permutes leading dimensions. That layout stays on the CPU EP.
+    batch_a = rng.standard_normal((4, 2, 3, 5)).astype(np.float32)
+    batch_b = rng.standard_normal((2, 3, 5, 6)).astype(np.float32)
+    batch_model = model(
+        [helper.make_node("FusedMatMul", ["A", "B"], ["Y"], domain="com.microsoft", transBatchA=1)],
+        [
+            helper.make_tensor_value_info("A", TensorProto.FLOAT, [4, 2, 3, 5]),
+            helper.make_tensor_value_info("B", TensorProto.FLOAT, [2, 3, 5, 6]),
+        ],
+        [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 3, 4, 6])],
+        [],
+        extra_opsets=(microsoft,),
+    )
+
     cpu = ort.SessionOptions()
     cpu.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     cpu_matmul = ort.InferenceSession(matmul_model.SerializeToString(), cpu)
     check("cpu matmul", cpu_matmul.run(None, {"X": x})[0], matmul_want)
+
+    optimized = ort.SessionOptions()
+    optimized.optimized_model_filepath = "/tmp/accel-fused-matmul.onnx"
+    ort.InferenceSession(transpose_model.SerializeToString(), optimized)
+    fused_graph = onnx.load("/tmp/accel-fused-matmul.onnx")
+    fused_nodes = [(node.domain, node.op_type) for node in fused_graph.graph.node]
+    if fused_nodes != [("com.microsoft", "FusedMatMul")]:
+        raise SystemExit(f"default optimizer did not produce FusedMatMul: {fused_nodes}")
+    trans_a = {attr.name: attr.i for attr in fused_graph.graph.node[0].attribute}.get("transA")
+    if trans_a != 1:
+        raise SystemExit(f"FusedMatMul transA is {trans_a}, expected 1")
+
+    batch_cpu = ort.SessionOptions()
+    batch_cpu.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+    batch_reference = ort.InferenceSession(batch_model.SerializeToString(), batch_cpu).run(
+        None, {"A": batch_a, "B": batch_b}
+    )[0]
 
     ort.register_execution_provider_library(EP_NAME, str(LIB))
     try:
@@ -111,10 +171,10 @@ def main():
         if len(devices) != 1:
             raise SystemExit(f"expected one AccelEP device, found {[d.ep_name for d in ort.get_ep_devices()]}")
 
-        def session(proto, optimize=False):
+        def session(proto, level=ort.GraphOptimizationLevel.ORT_DISABLE_ALL):
             options = ort.SessionOptions()
-            if not optimize:
-                options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
+            if level is not None:
+                options.graph_optimization_level = level
             options.add_provider_for_devices(devices, {})
             return ort.InferenceSession(proto.SerializeToString(), options)
 
@@ -126,13 +186,25 @@ def main():
         gemm_ops = lib.AccelEpGemmOps()
         kernel_matmuls = lib.AccelEpKernelMatmuls()
         copied = lib.AccelEpBytesToDevice()
-        # X and the Relu activation are copied. Both weights were uploaded at compile time.
+        copied_back = lib.AccelEpBytesToHost()
+        relu_epilogues = lib.AccelEpReluEpilogues()
+        # X is uploaded for the first matmul. The pre-Relu hidden stays on device and
+        # the epilogue writes the activation. The next matmul copies that activation in.
         expect_copy = (x.size + relu.size) * x.itemsize
-        if matmul_ops != 2 or gemm_ops != 0 or lib.AccelEpFusedMatmulOps() != 0 or kernel_matmuls != 2 or copied != expect_copy:
+        expect_back = (relu.size + matmul_want.size) * x.itemsize
+        if (
+            matmul_ops != 2
+            or gemm_ops != 0
+            or kernel_matmuls != 2
+            or relu_epilogues != 1
+            or copied != expect_copy
+            or copied_back != expect_back
+        ):
             raise SystemExit(
                 "matmul offload stats "
                 f"ops={matmul_ops} gemm={gemm_ops} kernels={kernel_matmuls} "
-                f"copied={copied} expected_copy={expect_copy}"
+                f"relu_epilogues={relu_epilogues} copied={copied} expected_copy={expect_copy} "
+                f"copied_back={copied_back} expected_back={expect_back}"
             )
 
         relu_session = session(relu_model)
@@ -141,7 +213,7 @@ def main():
         if (
             lib.AccelEpMatmulOps() != 0
             or lib.AccelEpGemmOps() != 0
-            or lib.AccelEpFusedMatmulOps() != 0
+            or lib.AccelEpReluEpilogues() != 0
             or lib.AccelEpBytesToDevice() != 0
         ):
             raise SystemExit("Relu was offloaded onto the accelerator")
@@ -150,12 +222,7 @@ def main():
         lib.AccelEpResetStats()
         check("accel gemm+add", gemm_session.run(None, {"X": gx, "V": gv})[0], gemm_want)
         gemm_copy = gx.size * gx.itemsize
-        if (
-            lib.AccelEpGemmOps() != 1
-            or lib.AccelEpMatmulOps() != 0
-            or lib.AccelEpFusedMatmulOps() != 0
-            or lib.AccelEpKernelMatmuls() != 1
-        ):
+        if lib.AccelEpGemmOps() != 1 or lib.AccelEpMatmulOps() != 0 or lib.AccelEpKernelMatmuls() != 1:
             raise SystemExit(
                 "gemm offload stats "
                 f"gemm={lib.AccelEpGemmOps()} matmul={lib.AccelEpMatmulOps()} "
@@ -165,158 +232,74 @@ def main():
             raise SystemExit(
                 f"gemm copied {lib.AccelEpBytesToDevice()} bytes, expected only X ({gemm_copy})"
             )
+        if lib.AccelEpReluEpilogues() != 0:
+            raise SystemExit("Add was folded into the Gemm epilogue")
 
-        fx = rng.standard_normal((4, 2)).astype(np.float32)
-        fw = rng.standard_normal((4, 3)).astype(np.float32)
-        fused_alpha = np.float32(1.5)
-        fused_model = contrib_model(
-            [
-                helper.make_node(
-                    "FusedMatMul",
-                    ["X", "W"],
-                    ["Y"],
-                    domain="com.microsoft",
-                    alpha=float(fused_alpha),
-                    transA=1,
-                    transB=0,
-                ),
-            ],
-            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 2])],
-            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 3])],
-            [numpy_helper.from_array(fw, "W")],
-        )
-        fused_want = fused_alpha * (fx.T @ fw)
-        fused_session = session(fused_model)
+        # Default session options leave the extended optimizer on.
+        transpose_session = session(transpose_model, None)
         lib.AccelEpResetStats()
-        check("fused matmul transA", fused_session.run(None, {"X": fx})[0], fused_want)
-        fused_copy = fx.size * fx.itemsize
-        if lib.AccelEpFusedMatmulOps() != 1 or lib.AccelEpMatmulOps() != 0 or lib.AccelEpGemmOps() != 0:
+        check("fused transpose matmul", transpose_session.run(None, {"X": tx})[0], transpose_want)
+        if lib.AccelEpMatmulOps() != 1 or lib.AccelEpGemmOps() != 0 or lib.AccelEpKernelMatmuls() != 1:
             raise SystemExit(
                 "fused matmul offload stats "
-                f"fused={lib.AccelEpFusedMatmulOps()} matmul={lib.AccelEpMatmulOps()} "
-                f"gemm={lib.AccelEpGemmOps()}"
+                f"ops={lib.AccelEpMatmulOps()} gemm={lib.AccelEpGemmOps()} "
+                f"kernels={lib.AccelEpKernelMatmuls()}"
             )
-        if lib.AccelEpKernelMatmuls() != 1 or lib.AccelEpBytesToDevice() != fused_copy:
+        if lib.AccelEpBytesToDevice() != tx.nbytes:
             raise SystemExit(
-                "fused matmul copy stats "
-                f"kernels={lib.AccelEpKernelMatmuls()} copied={lib.AccelEpBytesToDevice()} "
-                f"expected_copy={fused_copy}"
+                f"fused matmul copied {lib.AccelEpBytesToDevice()} bytes, expected only X ({tx.nbytes})"
             )
 
-        # Default optimizer leaves an authored FusedMatMul on this EP.
-        fused_default = session(fused_model, optimize=True)
-        lib.AccelEpResetStats()
-        check("fused matmul default optimizer", fused_default.run(None, {"X": fx})[0], fused_want)
-        if lib.AccelEpFusedMatmulOps() != 1 or lib.AccelEpBytesToDevice() != fused_copy:
-            raise SystemExit(
-                "default optimizer dropped FusedMatMul "
-                f"fused={lib.AccelEpFusedMatmulOps()} matmul={lib.AccelEpMatmulOps()} "
-                f"copied={lib.AccelEpBytesToDevice()}"
-            )
-
-        bx = rng.standard_normal((2, 1, 4, 3)).astype(np.float32)
-        bw = rng.standard_normal((4, 5)).astype(np.float32)
-        batch_alpha = np.float32(2)
-        batch_model = contrib_model(
+        relu_transpose = model(
             [
-                helper.make_node(
-                    "FusedMatMul",
-                    ["X", "W"],
-                    ["H"],
-                    domain="com.microsoft",
-                    alpha=float(batch_alpha),
-                    transA=1,
-                ),
+                helper.make_node("Transpose", ["X"], ["XT"], perm=[1, 0]),
+                helper.make_node("MatMul", ["XT", "W"], ["H"]),
                 helper.make_node("Relu", ["H"], ["Y"]),
-            ],
-            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 1, 4, 3])],
-            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 1, 3, 5])],
-            [numpy_helper.from_array(bw, "W")],
-        )
-        batch_want = np.maximum(batch_alpha * np.matmul(np.swapaxes(bx, -1, -2), bw), 0)
-        batch_session = session(batch_model)
-        lib.AccelEpResetStats()
-        check("fused matmul broadcast+relu", batch_session.run(None, {"X": bx})[0], batch_want)
-        batch_copy = bx.size * bx.itemsize
-        # Two batches of X. W was uploaded at compile time.
-        if (
-            lib.AccelEpFusedMatmulOps() != 1
-            or lib.AccelEpMatmulOps() != 0
-            or lib.AccelEpKernelMatmuls() != 2
-            or lib.AccelEpBytesToDevice() != batch_copy
-        ):
-            raise SystemExit(
-                "broadcast fused matmul stats "
-                f"fused={lib.AccelEpFusedMatmulOps()} matmul={lib.AccelEpMatmulOps()} "
-                f"kernels={lib.AccelEpKernelMatmuls()} "
-                f"copied={lib.AccelEpBytesToDevice()} expected_copy={batch_copy}"
-            )
-
-        # transBatchA moves axis 0 into the matrix-row slot. ORT's kernel accepts it only when both
-        # inputs share a rank of at least 3: X (2, 3, 4) becomes logical (3, 2, 4). This EP leaves that on CPU.
-        batch_x = rng.standard_normal((2, 3, 4)).astype(np.float32)
-        batch_w = rng.standard_normal((3, 4, 5)).astype(np.float32)
-        batch_transpose_model = contrib_model(
-            [
-                helper.make_node(
-                    "FusedMatMul",
-                    ["X", "W"],
-                    ["Y"],
-                    domain="com.microsoft",
-                    transBatchA=1,
-                ),
-            ],
-            [helper.make_tensor_value_info("X", TensorProto.FLOAT, [2, 3, 4])],
-            [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [3, 2, 5])],
-            [numpy_helper.from_array(batch_w, "W")],
-        )
-        cpu_options = ort.SessionOptions()
-        cpu_options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
-        cpu_batch = ort.InferenceSession(batch_transpose_model.SerializeToString(), cpu_options)
-        batch_transpose_session = session(batch_transpose_model)
-        lib.AccelEpResetStats()
-        check(
-            "transBatch stays on cpu",
-            batch_transpose_session.run(None, {"X": batch_x})[0],
-            cpu_batch.run(None, {"X": batch_x})[0],
-        )
-        if lib.AccelEpFusedMatmulOps() != 0 or lib.AccelEpMatmulOps() != 0 or lib.AccelEpBytesToDevice() != 0:
-            raise SystemExit("transBatch FusedMatMul was offloaded")
-
-        tx = rng.standard_normal((4, 2)).astype(np.float32)
-        tw = rng.standard_normal((4, 3)).astype(np.float32)
-        transpose_model = model(
-            [
-                helper.make_node("Transpose", ["X"], ["T"], perm=[1, 0]),
-                helper.make_node("MatMul", ["T", "W"], ["Y"]),
             ],
             [helper.make_tensor_value_info("X", TensorProto.FLOAT, [4, 2])],
             [helper.make_tensor_value_info("Y", TensorProto.FLOAT, [2, 3])],
             [numpy_helper.from_array(tw, "W")],
         )
-        transpose_session = session(transpose_model, optimize=True)
+        relu_transpose_session = session(relu_transpose, None)
         lib.AccelEpResetStats()
         check(
-            "transpose+matmul default optimizer",
-            transpose_session.run(None, {"X": tx})[0],
-            tx.T @ tw,
+            "fused matmul relu",
+            relu_transpose_session.run(None, {"X": tx})[0],
+            np.maximum(transpose_want, 0),
         )
-        accel_ops = lib.AccelEpMatmulOps() + lib.AccelEpFusedMatmulOps()
-        transpose_copy = tx.size * tx.itemsize
-        if accel_ops != 1 or lib.AccelEpGemmOps() != 0 or lib.AccelEpBytesToDevice() != transpose_copy:
+        if lib.AccelEpMatmulOps() != 1 or lib.AccelEpReluEpilogues() != 1 or lib.AccelEpBytesToDevice() != tx.nbytes:
             raise SystemExit(
-                "transpose+matmul offload stats "
-                f"matmul={lib.AccelEpMatmulOps()} fused={lib.AccelEpFusedMatmulOps()} "
-                f"gemm={lib.AccelEpGemmOps()} copied={lib.AccelEpBytesToDevice()} "
-                f"expected_copy={transpose_copy}"
+                "fused matmul+relu stats "
+                f"ops={lib.AccelEpMatmulOps()} relu={lib.AccelEpReluEpilogues()} "
+                f"copied={lib.AccelEpBytesToDevice()} expected={tx.nbytes}"
+            )
+
+        fused_session = session(fused_model)
+        lib.AccelEpResetStats()
+        check("explicit fused matmul", fused_session.run(None, {"X": fx})[0], fused_want)
+        if lib.AccelEpMatmulOps() != 1 or lib.AccelEpKernelMatmuls() != 1 or lib.AccelEpBytesToDevice() != fx.nbytes:
+            raise SystemExit(
+                "explicit fused matmul stats "
+                f"ops={lib.AccelEpMatmulOps()} kernels={lib.AccelEpKernelMatmuls()} "
+                f"copied={lib.AccelEpBytesToDevice()} expected={fx.nbytes}"
+            )
+
+        batch_session = session(batch_model)
+        lib.AccelEpResetStats()
+        check("transBatch stays on cpu", batch_session.run(None, {"A": batch_a, "B": batch_b})[0], batch_reference)
+        if lib.AccelEpMatmulOps() != 0 or lib.AccelEpGemmOps() != 0 or lib.AccelEpBytesToDevice() != 0:
+            raise SystemExit(
+                "transBatch was offloaded "
+                f"ops={lib.AccelEpMatmulOps()} gemm={lib.AccelEpGemmOps()} "
+                f"copied={lib.AccelEpBytesToDevice()}"
             )
     finally:
         ort.unregister_execution_provider_library(EP_NAME)
 
     print("ep tests passed")
-    print("matmul ops on accelerator: 2, relu left on CPU")
+    print("matmul ops on accelerator: 2, relu epilogue kept the hidden activation on device")
     print("gemm op on accelerator: 1, following add left on CPU")
-    print("fused matmul op on accelerator: 1, transBatch left on CPU")
+    print("fused matmul on accelerator: 1, copied only the activation")
 
 
 if __name__ == "__main__":

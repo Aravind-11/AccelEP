@@ -2,7 +2,7 @@
 
 AccelEP is an [ONNX Runtime](https://github.com/microsoft/onnxruntime) 1.31 execution provider for matrix ops. A CPU simulator stands in for the accelerator, so the plugin runs without a GPU. A hardware backend replaces three kernels on the same device interface.
 
-The provider claims one supported node at a time. Relu, Add, and every other op stay on the CPU execution provider.
+The provider claims one matrix op at a time. A Relu that is the only consumer of that op is applied on the device in `GemmEpilogue`, and the pre-activation is not copied back. Add and every other op stay on the CPU execution provider.
 
 ## Ops that run on the accelerator
 
@@ -24,7 +24,7 @@ All three ops require float32 and static shapes. A negative dimension stays on t
 - `CopyHostToDevice` and `CopyDeviceToHost` are the only way bytes cross that boundary.
 - `MatMul` computes row-major `C = A @ B`.
 - `Transpose` turns a `[rows, cols]` matrix into `[cols, rows]`.
-- `GemmEpilogue` applies `c = alpha * c + beta * broadcast(bias)`.
+- `GemmEpilogue` applies `c = alpha * c + beta * broadcast(bias)`, then Relu when the group includes one.
 
 Constant weights are uploaded once, when the node is compiled. Each run copies the activation inputs to the device and the result back to the host. The plugin does not take over ONNX Runtime's own host copies.
 
@@ -48,7 +48,7 @@ ep tests passed
 
 `make clean` removes `build/`.
 
-The C++ tests check hand-computed matmul, broadcast, the Gemm epilogue, FusedMatMul transpose and alpha, and that a weight uploaded at compile time is not copied again. The Python tests load the plugin with `register_execution_provider_library`, run `X @ W1 → Relu → @ W2`, a Gemm plus a later Add, an authored FusedMatMul, and a FusedMatMul followed by Relu. Results are compared with NumPy. Those graphs are loaded with `ORT_DISABLE_ALL` so the default optimizer does not rewrite a MatMul before this provider sees it. With the default optimizer left on, a Transpose followed by a MatMul still counts as one accelerator op, and an authored FusedMatMul stays on this provider.
+The C++ tests check hand-computed matmul, broadcast, the Gemm epilogue, FusedMatMul transpose and alpha, a Relu applied on the device, and that a weight uploaded at compile time is not copied again. The Python tests load the plugin with `register_execution_provider_library` and compare with NumPy. `X @ W1 → Relu → @ W2` runs both matmuls on the accelerator and applies that Relu in the first epilogue. A lone Relu stays on the CPU. A Gemm followed by Add leaves the Add on the CPU. An authored FusedMatMul runs on the accelerator, and a nonzero `transBatchA` stays on the CPU. With the default optimizer left on, a Transpose followed by a MatMul counts as one accelerator op, and a following Relu is included in that op.
 
 ## Registering the provider
 

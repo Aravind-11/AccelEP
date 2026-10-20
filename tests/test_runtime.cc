@@ -109,74 +109,10 @@ void TestZeroK() {
   ExpectClose(out, {0, 0, 0, 0, 0, 0});
 }
 
-void TestFusedMatMulTransAAlpha() {
-  const std::vector<float> a = {1, 2, 3, 4, 5, 6};
-  const std::vector<float> b = {1, 0, 0, 1, 1, 1};
-  auto device = accel::CreateSimDevice();
-  std::vector<float> out(4);
-  accel::GemmConfig config;
-  config.trans_a = true;
-  config.alpha = 1.5f;
-  accel::ExecuteFusedMatMul(*device, {a.data(), nullptr, {3, 2}}, {b.data(), nullptr, {3, 2}}, config, out.data());
-  ExpectClose(out, {9, 12, 12, 15});
-}
-
-void TestFusedMatMulBatchTransB() {
-  const std::vector<float> a = {1, 2, 3, 4, 5, 6, 1, 0, 0, 0, 1, 0};
-  const std::vector<float> b = {1, 0, 1, 0, 1, 1};
-  auto device = accel::CreateSimDevice();
-  accel::ResetAcceleratorStats();
-  std::vector<float> out(8);
-  accel::GemmConfig config;
-  config.trans_b = true;
-  accel::ExecuteFusedMatMul(*device, {a.data(), nullptr, {2, 2, 3}}, {b.data(), nullptr, {2, 3}}, config, out.data());
-  ExpectClose(out, {4, 5, 10, 11, 1, 0, 0, 1});
-  const accel::AcceleratorStats stats = accel::GetAcceleratorStats();
-  CHECK(stats.fused_matmul_ops == 1);
-  CHECK(stats.matmul_ops == 0);
-  CHECK(stats.kernel_matmuls == 2);
-}
-
-void TestFusedMatMulAlphaZero() {
-  const std::vector<float> a = {1, 2, 3, 4};
-  const std::vector<float> b = {5, 6, 7, 8};
-  auto device = accel::CreateSimDevice();
-  std::vector<float> out(4, 9.f);
-  accel::GemmConfig config;
-  config.alpha = 0.f;
-  accel::ExecuteFusedMatMul(*device, {a.data(), nullptr, {2, 2}}, {b.data(), nullptr, {2, 2}}, config, out.data());
-  ExpectClose(out, {0, 0, 0, 0});
-}
-
-void TestFusedWeightStaysOnDevice() {
-  const std::vector<float> a = {1, 2, 3, 4, 5, 6};
-  std::vector<float> b = {1, 0, 1, 0, 1, 1};
-  auto device = accel::CreateSimDevice();
-  accel::OwnedBuffer weight = accel::Upload(*device, b.data(), {2, 3});
-  b[0] = 0;
-  accel::ResetAcceleratorStats();
-  std::vector<float> out(4);
-  accel::Operand b_op;
-  b_op.on_device = &weight;
-  b_op.shape = weight.shape;
-  accel::GemmConfig config;
-  config.trans_b = true;
-  accel::ExecuteFusedMatMul(*device, {a.data(), nullptr, {2, 3}}, b_op, config, out.data());
-  ExpectClose(out, {4, 5, 10, 11});
-  const accel::AcceleratorStats stats = accel::GetAcceleratorStats();
-  CHECK(stats.bytes_to_device == static_cast<int64_t>(a.size() * sizeof(float)));
-  CHECK(stats.fused_matmul_ops == 1);
-  CHECK(stats.matmul_ops == 0);
-  CHECK(stats.kernel_matmuls == 1);
-  CHECK(stats.bytes_to_host == static_cast<int64_t>(out.size() * sizeof(float)));
-}
-
 void TestRejectsBadShape() {
   std::vector<int64_t> out;
   CHECK(!accel::InferMatMulShape({2, 3}, {4, 5}, &out));
   CHECK(!accel::InferGemmShape({2, 3}, false, {2, 3}, false, nullptr, &out));
-  CHECK(!accel::InferFusedMatMulShape({4}, false, {4, 3}, false, &out));
-  CHECK(!accel::InferFusedMatMulShape({2, 3}, true, {4, 5}, false, &out));
   auto device = accel::CreateSimDevice();
   bool threw = false;
   try {
@@ -202,6 +138,70 @@ void TestUnknownFreeThrows() {
   CHECK(threw);
 }
 
+void TestFusedMatMulTransAAlpha() {
+  // Stored A is [K, M] = [3, 2]. transA yields logical [[1, 3, 5], [2, 4, 6]].
+  const std::vector<float> a = {1, 2, 3, 4, 5, 6};
+  const std::vector<float> b = {1, 0, 0, 1, 1, 1};
+  auto device = accel::CreateSimDevice();
+  std::vector<float> out(4);
+  accel::FusedMatMulConfig config;
+  config.trans_a = true;
+  config.alpha = 1.5f;
+  accel::ExecuteFusedMatMul(*device, {a.data(), nullptr, {3, 2}}, {b.data(), nullptr, {3, 2}}, config, false,
+                            out.data());
+  ExpectClose(out, {9, 12, 12, 15});
+}
+
+void TestFusedMatMulBroadcastTransB() {
+  const std::vector<float> a = {1, 2, 3, 4, 5, 6, 1, 0, 1, 0, 1, 1};
+  // Physical [2, 3], transposed on the last two dimensions to [[1, 0], [0, 1], [1, 1]].
+  const std::vector<float> b = {1, 0, 1, 0, 1, 1};
+  auto device = accel::CreateSimDevice();
+  std::vector<float> out(8);
+  accel::FusedMatMulConfig config;
+  config.trans_b = true;
+  accel::ExecuteFusedMatMul(*device, {a.data(), nullptr, {2, 2, 3}}, {b.data(), nullptr, {2, 3}}, config, false,
+                            out.data());
+  ExpectClose(out, {4, 5, 10, 11, 2, 1, 1, 2});
+}
+
+void TestMatMulReluStaysOnDevice() {
+  const std::vector<float> a = {1, -2, -3, 4};
+  const std::vector<float> b = {1, 0, 0, 1};
+  auto device = accel::CreateSimDevice();
+  accel::ResetAcceleratorStats();
+  std::vector<float> out(4, 9.f);
+  accel::ExecuteMatMul(*device, {a.data(), nullptr, {2, 2}}, {b.data(), nullptr, {2, 2}}, out.data(), true);
+  ExpectClose(out, {1, 0, 0, 4});
+  const accel::AcceleratorStats stats = accel::GetAcceleratorStats();
+  CHECK(stats.relu_epilogues == 1);
+  CHECK(stats.matmul_ops == 1);
+  CHECK(stats.bytes_to_host == static_cast<int64_t>(out.size() * sizeof(float)));
+  CHECK(stats.bytes_to_device == static_cast<int64_t>((a.size() + b.size()) * sizeof(float)));
+}
+
+void TestGemmReluEpilogue() {
+  const std::vector<float> a = {1, 0, 0, 1};
+  const std::vector<float> b = {1, 0, 0, 1};
+  const std::vector<float> bias = {-2, 3};
+  auto device = accel::CreateSimDevice();
+  accel::ResetAcceleratorStats();
+  std::vector<float> out(4);
+  accel::GemmConfig config;
+  const accel::Operand bias_op{bias.data(), nullptr, {2}};
+  accel::ExecuteGemm(*device, {a.data(), nullptr, {2, 2}}, {b.data(), nullptr, {2, 2}}, &bias_op, config, out.data(),
+                     true);
+  ExpectClose(out, {0, 3, 0, 4});
+  CHECK(accel::GetAcceleratorStats().relu_epilogues == 1);
+  CHECK(accel::GetAcceleratorStats().gemm_ops == 1);
+}
+
+void TestRejectsFusedShape() {
+  std::vector<int64_t> out;
+  // transA turns [2, 3] into [3, 2], which does not contract with [3, 4].
+  CHECK(!accel::InferFusedMatMulShape({2, 3}, true, {3, 4}, false, &out));
+}
+
 void TestHostCopyIsPrivate() {
   float host[4] = {1.f, 2.f, 3.f, 4.f};
   auto device = accel::CreateSimDevice();
@@ -220,14 +220,15 @@ int main() {
   TestIdentityBatch();
   TestBroadcastHandValues();
   TestGemmTransBias();
-  TestFusedMatMulTransAAlpha();
-  TestFusedMatMulBatchTransB();
-  TestFusedMatMulAlphaZero();
-  TestFusedWeightStaysOnDevice();
   TestWeightStaysOnDevice();
   TestZeroK();
   TestRejectsBadShape();
   TestUnknownFreeThrows();
+  TestFusedMatMulTransAAlpha();
+  TestFusedMatMulBroadcastTransB();
+  TestMatMulReluStaysOnDevice();
+  TestGemmReluEpilogue();
+  TestRejectsFusedShape();
   TestHostCopyIsPrivate();
   if (g_failures != 0) {
     std::fprintf(stderr, "%d checks failed\n", g_failures);

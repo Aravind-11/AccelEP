@@ -69,12 +69,12 @@ class Device {
   // src is row-major [rows, cols]. dst is row-major [cols, rows].
   virtual void Transpose(DeviceBuffer src, DeviceBuffer dst, int64_t rows, int64_t cols) = 0;
 
-  // c[i, j] = alpha * c[i, j] + beta * broadcast(bias)[i, j].
-  // `bias` is null when the Gemm has no C input. `bias_shape` is right-aligned
-  // against [m, n] and must already be unidirectional-broadcastable to it.
+  // c[i, j] = alpha * c[i, j] + beta * broadcast(bias)[i, j], then Relu when
+  // `relu` is set. `bias` is null when the Gemm has no C input. `bias_shape`
+  // is right-aligned against [m, n] and must already be unidirectional-broadcastable.
   virtual void GemmEpilogue(DeviceBuffer c, int64_t m, int64_t n, float alpha,
                             const DeviceBuffer* bias, const std::vector<int64_t>& bias_shape,
-                            float beta) = 0;
+                            float beta, bool relu = false) = 0;
 };
 
 std::unique_ptr<Device> CreateSimDevice();
