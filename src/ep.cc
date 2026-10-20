@@ -4,7 +4,10 @@
 
 #include "accel/runtime.h"
 
+#include <cmath>
+#include <cstdint>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -12,23 +15,62 @@
 #include <utility>
 #include <vector>
 
+constexpr bool kAccelEpStreamAware = false;
+static_assert(!kAccelEpStreamAware, "AccelEP does not create sync streams");
+
 namespace {
 
 #define ACCEL_EXPORT __attribute__((visibility("default")))
 
 enum class OpKind { MatMul, Gemm, FusedMatMul };
 
-struct CompiledInput {
+struct StepInput {
   std::string name;
   bool constant = false;
+  bool produced = false;
+  bool pretransposed = false;
+  std::vector<int64_t> profile_shape;
+};
+
+struct CompiledStep {
+  OpKind kind = OpKind::MatMul;
+  std::vector<StepInput> inputs;
+  accel::GemmConfig gemm{};
+  accel::FusedMatMulConfig fused{};
+  accel::Activation activation = accel::Activation::None;
+  bool has_residual = false;
+  StepInput residual;
+  std::string output_name;
+  std::vector<int64_t> output_shape;
+  bool clear_trans_a = false;
+  bool clear_trans_b = false;
 };
 
 struct CompiledKernel {
+  std::vector<CompiledStep> steps;
+  std::vector<std::string> runtime_names;
+  bool leading_dynamic = false;
+  std::vector<int64_t> dyn_a_tail;
+  std::vector<int64_t> dyn_b_shape;
+  std::vector<int64_t> dyn_y_tail;
+};
+
+struct MatrixInfo {
   OpKind kind = OpKind::MatMul;
-  std::vector<CompiledInput> inputs;
+  std::vector<std::string> names;
+  std::vector<std::vector<int64_t>> shapes;
+  std::string output_name;
+  std::vector<int64_t> output_shape;
   accel::GemmConfig gemm{};
   accel::FusedMatMulConfig fused{};
-  bool relu = false;
+};
+
+struct DynInfo {
+  std::vector<int64_t> a_tail;
+  std::vector<int64_t> b_shape;
+  std::vector<int64_t> y_tail;
+  std::vector<std::string> names;
+  std::string output_name;
 };
 
 class AccelEp;
@@ -63,7 +105,7 @@ class AccelEpFactory : public OrtEpFactory {
   static const char* ORT_API_CALL GetVendorImpl(const OrtEpFactory* /*self*/) noexcept { return "Accel"; }
   static uint32_t ORT_API_CALL GetVendorIdImpl(const OrtEpFactory* /*self*/) noexcept { return 0xACCE; }
   static const char* ORT_API_CALL GetVersionImpl(const OrtEpFactory* /*self*/) noexcept { return "0.1.0"; }
-  static bool ORT_API_CALL IsStreamAwareImpl(const OrtEpFactory* /*self*/) noexcept { return false; }
+  static bool ORT_API_CALL IsStreamAwareImpl(const OrtEpFactory* /*self*/) noexcept { return kAccelEpStreamAware; }
 
   static OrtStatus* ORT_API_CALL CreateDataTransferImpl(OrtEpFactory* /*self*/,
                                                         OrtDataTransferImpl** data_transfer) noexcept {
@@ -95,8 +137,8 @@ class AccelEp : public OrtEp {
     ReleaseNodeComputeInfos = ReleaseNodeComputeInfosImpl;
 
     OrtStatus* status = api.Logger_LogMessage(&logger, ORT_LOGGING_LEVEL_INFO,
-                                              "AccelEP ready: MatMul, FusedMatMul, and Gemm run on the accelerator", __FILE__,
-                                              __LINE__, __FUNCTION__);
+                                              "AccelEP ready: MatMul, FusedMatMul, and Gemm run on the accelerator",
+                                              __FILE__, __LINE__, __FUNCTION__);
     api.ReleaseStatus(status);
   }
 
@@ -105,13 +147,20 @@ class AccelEp : public OrtEp {
   const OrtEpApi& ep_api;
   std::string name;
   const OrtLogger& logger;
+  // Device is declared first so weight buffers are freed while it is still alive.
   std::unique_ptr<accel::Device> device;
   std::unordered_map<std::string, accel::OwnedBuffer> weights;
+  std::unordered_map<std::string, accel::OwnedBuffer> transposed_weights;
   std::unordered_map<std::string, std::unique_ptr<CompiledKernel>> kernels;
 
   accel::OwnedBuffer* FindWeight(const std::string& weight_name) {
     auto it = weights.find(weight_name);
     return it == weights.end() ? nullptr : &it->second;
+  }
+
+  accel::OwnedBuffer* FindTransposed(const std::string& weight_name) {
+    auto it = transposed_weights.find(weight_name);
+    return it == transposed_weights.end() ? nullptr : &it->second;
   }
 
  private:
@@ -154,7 +203,29 @@ bool KnownFusedMatMulAttr(const std::string& name) {
   return name == "transA" || name == "transB" || name == "transBatchA" || name == "transBatchB" || name == "alpha";
 }
 
-bool FloatShape(const Ort::ConstValueInfo& value, std::vector<int64_t>* shape) {
+const char* OpName(OpKind kind) {
+  if (kind == OpKind::Gemm) {
+    return "Gemm";
+  }
+  if (kind == OpKind::FusedMatMul) {
+    return "FusedMatMul";
+  }
+  return "MatMul";
+}
+
+std::vector<Ort::ConstValueInfo> LivePorts(const std::vector<Ort::ConstValueInfo>& values) {
+  std::vector<Ort::ConstValueInfo> ports;
+  for (const Ort::ConstValueInfo& value : values) {
+    if (value == nullptr || value.GetName().empty()) {
+      continue;
+    }
+    ports.push_back(value);
+  }
+  return ports;
+}
+
+bool TensorOf(const Ort::ConstValueInfo& value, ONNXTensorElementDataType type, std::vector<int64_t>* shape,
+              bool allow_negative) {
   if (value == nullptr) {
     return false;
   }
@@ -163,22 +234,31 @@ bool FloatShape(const Ort::ConstValueInfo& value, std::vector<int64_t>* shape) {
     return false;
   }
   const Ort::ConstTensorTypeAndShapeInfo tensor = type_info.GetTensorTypeAndShapeInfo();
-  if (tensor.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+  if (tensor.GetElementType() != type) {
     return false;
   }
   *shape = tensor.GetShape();
-  for (int64_t dim : *shape) {
-    if (dim < 0) {
-      return false;
+  if (!allow_negative) {
+    for (int64_t dim : *shape) {
+      if (dim < 0) {
+        return false;
+      }
     }
   }
   return true;
 }
 
+bool FloatShape(const Ort::ConstValueInfo& value, std::vector<int64_t>* shape) {
+  return TensorOf(value, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, shape, false);
+}
+
+bool AttrPresent(const Ort::ConstOpAttr& attr) { return static_cast<const OrtOpAttr*>(attr) != nullptr; }
+
 bool ReadIntAttr(const Ort::ConstNode& node, const char* attr_name, int64_t fallback, int64_t* out) {
   Ort::ConstOpAttr attr{nullptr};
   Ort::Status status = node.GetAttributeByName(attr_name, attr);
-  if (!status.IsOK()) {
+  // Unset optional attributes return OK and a null OrtOpAttr (Node_GetAttributeByName).
+  if (!status.IsOK() || !AttrPresent(attr)) {
     *out = fallback;
     return true;
   }
@@ -188,14 +268,26 @@ bool ReadIntAttr(const Ort::ConstNode& node, const char* attr_name, int64_t fall
 bool ReadFloatAttr(const Ort::ConstNode& node, const char* attr_name, float fallback, float* out) {
   Ort::ConstOpAttr attr{nullptr};
   Ort::Status status = node.GetAttributeByName(attr_name, attr);
-  if (!status.IsOK()) {
+  if (!status.IsOK() || !AttrPresent(attr)) {
     *out = fallback;
     return true;
   }
   return attr.GetValue(*out).IsOK();
 }
 
-bool MatchNode(const Ort::ConstNode& node, CompiledKernel* kernel) {
+bool HasAttr(const Ort::ConstNode& node, const char* attr_name) {
+  Ort::ConstOpAttr attr{nullptr};
+  return node.GetAttributeByName(attr_name, attr).IsOK() && AttrPresent(attr);
+}
+
+std::string TrimNul(std::string value) {
+  while (!value.empty() && value.back() == '\0') {
+    value.pop_back();
+  }
+  return value;
+}
+
+bool MatchMatrix(const Ort::ConstNode& node, MatrixInfo* info) {
   const std::string domain = node.GetDomain();
   const std::string op = node.GetOperatorType();
   const bool fused_matmul = op == "FusedMatMul";
@@ -215,46 +307,36 @@ bool MatchNode(const Ort::ConstNode& node, CompiledKernel* kernel) {
   } else {
     return false;
   }
-  kernel->relu = false;
 
-  std::vector<Ort::ConstValueInfo> inputs = node.GetInputs();
-  std::vector<std::string> names;
-  std::vector<std::vector<int64_t>> shapes;
-  names.reserve(inputs.size());
+  const std::vector<Ort::ConstValueInfo> inputs = LivePorts(node.GetInputs());
+  const std::vector<Ort::ConstValueInfo> outputs = LivePorts(node.GetOutputs());
+  if (outputs.size() != 1) {
+    return false;
+  }
+  info->names.clear();
+  info->shapes.clear();
   for (const Ort::ConstValueInfo& input : inputs) {
-    if (input == nullptr) {
-      continue;
-    }
-    const std::string input_name = input.GetName();
-    if (input_name.empty()) {
-      continue;
-    }
     std::vector<int64_t> shape;
     if (!FloatShape(input, &shape)) {
       return false;
     }
-    names.push_back(input_name);
-    shapes.push_back(std::move(shape));
+    info->names.push_back(input.GetName());
+    info->shapes.push_back(std::move(shape));
   }
-
-  std::vector<Ort::ConstValueInfo> outputs = node.GetOutputs();
-  if (outputs.size() != 1) {
+  if (!FloatShape(outputs[0], &info->output_shape)) {
     return false;
   }
-  std::vector<int64_t> output_shape;
-  if (!FloatShape(outputs[0], &output_shape)) {
-    return false;
-  }
+  info->output_name = outputs[0].GetName();
 
   std::vector<int64_t> inferred;
-  kernel->inputs.clear();
   if (op == "MatMul") {
-    if (names.size() != 2 || !accel::InferMatMulShape(shapes[0], shapes[1], &inferred) || inferred != output_shape) {
+    if (info->names.size() != 2 ||
+        !accel::InferMatMulShape(info->shapes[0], info->shapes[1], &inferred) || inferred != info->output_shape) {
       return false;
     }
-    kernel->kind = OpKind::MatMul;
+    info->kind = OpKind::MatMul;
   } else if (op == "Gemm") {
-    if (names.size() != 2 && names.size() != 3) {
+    if (info->names.size() != 2 && info->names.size() != 3) {
       return false;
     }
     int64_t trans_a = 0;
@@ -265,52 +347,435 @@ bool MatchNode(const Ort::ConstNode& node, CompiledKernel* kernel) {
         !ReadFloatAttr(node, "alpha", 1.f, &alpha) || !ReadFloatAttr(node, "beta", 1.f, &beta)) {
       return false;
     }
-    if ((trans_a != 0 && trans_a != 1) || (trans_b != 0 && trans_b != 1)) {
+    if (!std::isfinite(alpha) || (trans_a != 0 && trans_a != 1) || (trans_b != 0 && trans_b != 1)) {
       return false;
     }
-    const std::vector<int64_t>* bias = names.size() == 3 ? &shapes[2] : nullptr;
-    if (!accel::InferGemmShape(shapes[0], trans_a != 0, shapes[1], trans_b != 0, bias, &inferred) ||
-        inferred != output_shape) {
+    const std::vector<int64_t>* bias = info->names.size() == 3 ? &info->shapes[2] : nullptr;
+    if (!accel::InferGemmShape(info->shapes[0], trans_a != 0, info->shapes[1], trans_b != 0, bias, &inferred) ||
+        inferred != info->output_shape) {
       return false;
     }
-    kernel->kind = OpKind::Gemm;
-    kernel->gemm.trans_a = trans_a != 0;
-    kernel->gemm.trans_b = trans_b != 0;
-    kernel->gemm.alpha = alpha;
-    kernel->gemm.beta = beta;
+    info->kind = OpKind::Gemm;
+    info->gemm.trans_a = trans_a != 0;
+    info->gemm.trans_b = trans_b != 0;
+    info->gemm.alpha = alpha;
+    info->gemm.beta = beta;
   } else if (op == "FusedMatMul") {
     int64_t trans_a = 0;
     int64_t trans_b = 0;
     int64_t trans_batch_a = 0;
     int64_t trans_batch_b = 0;
     float alpha = 1.f;
-    if (names.size() != 2 || !ReadIntAttr(node, "transA", 0, &trans_a) || !ReadIntAttr(node, "transB", 0, &trans_b) ||
-        !ReadIntAttr(node, "transBatchA", 0, &trans_batch_a) ||
+    if (info->names.size() != 2 || !ReadIntAttr(node, "transA", 0, &trans_a) ||
+        !ReadIntAttr(node, "transB", 0, &trans_b) || !ReadIntAttr(node, "transBatchA", 0, &trans_batch_a) ||
         !ReadIntAttr(node, "transBatchB", 0, &trans_batch_b) || !ReadFloatAttr(node, "alpha", 1.f, &alpha)) {
       return false;
     }
-    // Batch transposition is a different layout. Leave those nodes on the CPU EP.
-    if (trans_batch_a != 0 || trans_batch_b != 0 || (trans_a != 0 && trans_a != 1) || (trans_b != 0 && trans_b != 1)) {
+    if (!std::isfinite(alpha) || trans_batch_a != 0 || trans_batch_b != 0 || (trans_a != 0 && trans_a != 1) ||
+        (trans_b != 0 && trans_b != 1)) {
       return false;
     }
-    if (!accel::InferFusedMatMulShape(shapes[0], trans_a != 0, shapes[1], trans_b != 0, &inferred) ||
-        inferred != output_shape) {
+    if (!accel::InferFusedMatMulShape(info->shapes[0], trans_a != 0, info->shapes[1], trans_b != 0, &inferred) ||
+        inferred != info->output_shape) {
       return false;
     }
-    kernel->kind = OpKind::FusedMatMul;
-    kernel->fused.trans_a = trans_a != 0;
-    kernel->fused.trans_b = trans_b != 0;
-    kernel->fused.alpha = alpha;
+    info->kind = OpKind::FusedMatMul;
+    info->fused.trans_a = trans_a != 0;
+    info->fused.trans_b = trans_b != 0;
+    info->fused.alpha = alpha;
   } else {
     return false;
   }
+  return true;
+}
 
-  kernel->inputs.resize(names.size());
-  for (size_t i = 0; i < names.size(); ++i) {
-    kernel->inputs[i].name = std::move(names[i]);
-    kernel->inputs[i].constant = false;
+bool MatchLeading(const Ort::ConstNode& node, DynInfo* dyn) {
+  if (!OnnxDomain(node.GetDomain()) || node.GetOperatorType() != "MatMul") {
+    return false;
+  }
+  const std::vector<Ort::ConstValueInfo> inputs = LivePorts(node.GetInputs());
+  const std::vector<Ort::ConstValueInfo> outputs = LivePorts(node.GetOutputs());
+  if (inputs.size() != 2 || outputs.size() != 1) {
+    return false;
+  }
+  std::vector<int64_t> a_shape;
+  std::vector<int64_t> b_shape;
+  std::vector<int64_t> y_shape;
+  if (!TensorOf(inputs[0], ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &a_shape, true) ||
+      !TensorOf(inputs[1], ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &b_shape, true) ||
+      !TensorOf(outputs[0], ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &y_shape, true)) {
+    return false;
+  }
+  if (a_shape.size() < 2 || b_shape.size() < 2 || y_shape.empty() || !(a_shape[0] < 0 && y_shape[0] < 0)) {
+    return false;
+  }
+  for (size_t i = 1; i < a_shape.size(); ++i) {
+    if (a_shape[i] < 0) {
+      return false;
+    }
+  }
+  for (size_t i = 1; i < y_shape.size(); ++i) {
+    if (y_shape[i] < 0) {
+      return false;
+    }
+  }
+  int64_t max_b = 0;
+  for (int64_t dim : b_shape) {
+    if (dim < 0) {
+      return false;
+    }
+    if (dim > max_b) {
+      max_b = dim;
+    }
+  }
+  if (a_shape.back() < 0 || b_shape[b_shape.size() - 2] < 0 || a_shape.back() != b_shape[b_shape.size() - 2]) {
+    return false;
+  }
+  if (max_b == std::numeric_limits<int64_t>::max()) {
+    return false;
+  }
+  const int64_t probe = std::max(max_b, static_cast<int64_t>(1)) + 1;
+  if (probe < 2) {
+    return false;
+  }
+  for (int64_t dim : b_shape) {
+    if (dim == probe) {
+      return false;
+    }
+  }
+  std::vector<int64_t> a_probe = a_shape;
+  std::vector<int64_t> y_probe = y_shape;
+  a_probe[0] = probe;
+  y_probe[0] = probe;
+  std::vector<int64_t> inferred;
+  if (!accel::InferMatMulShape(a_probe, b_shape, &inferred) || inferred != y_probe || inferred[0] != probe) {
+    return false;
+  }
+  dyn->a_tail.assign(a_shape.begin() + 1, a_shape.end());
+  dyn->b_shape = b_shape;
+  dyn->y_tail.assign(y_shape.begin() + 1, y_shape.end());
+  dyn->names = {inputs[0].GetName(), inputs[1].GetName()};
+  dyn->output_name = outputs[0].GetName();
+  return true;
+}
+
+bool OutputName(const Ort::ConstNode& node, std::string* name) {
+  const std::vector<Ort::ConstValueInfo> outputs = LivePorts(node.GetOutputs());
+  if (outputs.size() != 1) {
+    return false;
+  }
+  *name = outputs[0].GetName();
+  return !name->empty();
+}
+
+bool SoleConsumer(const Ort::ConstNode& node, Ort::ConstNode* consumer) {
+  const std::vector<Ort::ConstValueInfo> outputs = node.GetOutputs();
+  if (outputs.size() != 1 || outputs[0] == nullptr || outputs[0].GetName().empty() || outputs[0].IsGraphOutput()) {
+    return false;
+  }
+  const std::vector<Ort::ValueInfoConsumerProducerInfo> consumers = outputs[0].GetConsumers();
+  if (consumers.size() != 1 || consumers[0].node == nullptr) {
+    return false;
+  }
+  *consumer = consumers[0].node;
+  return true;
+}
+
+bool FollowingActivation(const Ort::ConstNode& node, const char* op_type, Ort::ConstNode* activation) {
+  const std::vector<Ort::ConstValueInfo> outputs = node.GetOutputs();
+  if (outputs.size() != 1 || outputs[0] == nullptr || outputs[0].IsGraphOutput()) {
+    return false;
+  }
+  const std::vector<Ort::ValueInfoConsumerProducerInfo> consumers = outputs[0].GetConsumers();
+  if (consumers.size() != 1 || consumers[0].index != 0 || consumers[0].node == nullptr) {
+    return false;
+  }
+  const Ort::ConstNode& candidate = consumers[0].node;
+  if (!OnnxDomain(candidate.GetDomain()) || candidate.GetOperatorType() != op_type) {
+    return false;
+  }
+  const std::vector<Ort::ConstValueInfo> act_inputs = candidate.GetInputs();
+  const std::vector<Ort::ConstValueInfo> act_outputs = candidate.GetOutputs();
+  if (act_inputs.size() != 1 || act_outputs.size() != 1 || act_inputs[0] == nullptr || act_outputs[0] == nullptr) {
+    return false;
+  }
+  if (act_inputs[0].GetName() != outputs[0].GetName()) {
+    return false;
+  }
+  std::vector<int64_t> produced;
+  std::vector<int64_t> activated;
+  if (!FloatShape(outputs[0], &produced) || !FloatShape(act_outputs[0], &activated) || produced != activated) {
+    return false;
+  }
+  *activation = candidate;
+  return true;
+}
+
+bool FollowingRelu(const Ort::ConstNode& node, Ort::ConstNode* relu) { return FollowingActivation(node, "Relu", relu); }
+
+bool GeluEpilogueOk(const Ort::ConstNode& node) {
+  if (!OnnxDomain(node.GetDomain()) || node.GetOperatorType() != "Gelu" || node.GetSinceVersion() < 20) {
+    return false;
+  }
+  for (const Ort::ConstOpAttr& attr : node.GetAttributes()) {
+    if (attr.GetName() != "approximate") {
+      return false;
+    }
+  }
+  if (!HasAttr(node, "approximate")) {
+    return true;
+  }
+  Ort::ConstOpAttr attr{nullptr};
+  std::string value;
+  if (!node.GetAttributeByName("approximate", attr).IsOK() || !attr.GetValue(value).IsOK()) {
+    return false;
+  }
+  return TrimNul(std::move(value)) == "none";
+}
+
+bool FollowingGelu(const Ort::ConstNode& node, Ort::ConstNode* gelu) {
+  Ort::ConstNode candidate{nullptr};
+  if (!FollowingActivation(node, "Gelu", &candidate) || !GeluEpilogueOk(candidate)) {
+    return false;
+  }
+  *gelu = candidate;
+  return true;
+}
+
+bool ApproximateIs(const Ort::ConstNode& node, const char* expected) {
+  if (!HasAttr(node, "approximate")) {
+    return false;
+  }
+  Ort::ConstOpAttr attr{nullptr};
+  std::string value;
+  if (!node.GetAttributeByName("approximate", attr).IsOK() || !AttrPresent(attr) || !attr.GetValue(value).IsOK()) {
+    return false;
+  }
+  return TrimNul(std::move(value)) == expected;
+}
+
+// ORT's Gelu kernel rejects approximate values other than "none" and "tanh".
+// tanh still runs on CPU after this MatMul. Any other value throws after the
+// MatMul would already have uploaded weights, so the whole group stays on CPU.
+bool UnsupportedGeluConsumer(const Ort::ConstNode& node) {
+  Ort::ConstNode candidate{nullptr};
+  if (!FollowingActivation(node, "Gelu", &candidate) || GeluEpilogueOk(candidate)) {
+    return false;
+  }
+  return !ApproximateIs(candidate, "tanh");
+}
+
+bool OtherInputsAreConstant(const Ort::ConstNode& producer, const Ort::ConstNode& consumer) {
+  std::string produced;
+  if (!OutputName(producer, &produced)) {
+    return false;
+  }
+  bool saw = false;
+  for (const Ort::ConstValueInfo& input : LivePorts(consumer.GetInputs())) {
+    if (input.GetName() == produced) {
+      saw = true;
+      continue;
+    }
+    if (!input.IsConstantInitializer()) {
+      return false;
+    }
+  }
+  return saw;
+}
+
+bool SameFloatShape(const Ort::ConstValueInfo& left, const Ort::ConstValueInfo& right) {
+  std::vector<int64_t> a;
+  std::vector<int64_t> b;
+  return FloatShape(left, &a) && FloatShape(right, &b) && a == b;
+}
+
+bool BothMatMulInputsRuntime(const Ort::ConstNode& matmul) {
+  int runtime = 0;
+  for (const Ort::ConstValueInfo& input : LivePorts(matmul.GetInputs())) {
+    if (input.IsConstantInitializer()) {
+      return false;
+    }
+    ++runtime;
+  }
+  return runtime == 2;
+}
+
+bool FollowingAdd(const Ort::ConstNode& matmul, Ort::ConstNode* add) {
+  if (!OnnxDomain(matmul.GetDomain()) || matmul.GetOperatorType() != "MatMul") {
+    return false;
+  }
+  const std::vector<Ort::ConstValueInfo> outputs = matmul.GetOutputs();
+  if (outputs.size() != 1 || outputs[0] == nullptr || outputs[0].IsGraphOutput()) {
+    return false;
+  }
+  const std::vector<Ort::ValueInfoConsumerProducerInfo> consumers = outputs[0].GetConsumers();
+  if (consumers.size() != 1 || consumers[0].node == nullptr) {
+    return false;
+  }
+  const Ort::ConstNode& candidate = consumers[0].node;
+  if (!OnnxDomain(candidate.GetDomain()) || candidate.GetOperatorType() != "Add" ||
+      !candidate.GetAttributes().empty()) {
+    return false;
+  }
+  const std::vector<Ort::ConstValueInfo> add_inputs = LivePorts(candidate.GetInputs());
+  const std::vector<Ort::ConstValueInfo> add_outputs = LivePorts(candidate.GetOutputs());
+  if (add_inputs.size() != 2 || add_outputs.size() != 1) {
+    return false;
+  }
+  // A projection MatMul (one constant weight) whose Add feeds two nodes stays
+  // on CPU. The prenorm context MatMul reads two activations; that Add still
+  // fuses when its result feeds LayerNorm and the MLP residual. A graph output
+  // has no fan-out and can still be the epilogue.
+  if (!add_outputs[0].IsGraphOutput() && add_outputs[0].GetConsumers().size() > 1 &&
+      !BothMatMulInputsRuntime(matmul)) {
+    return false;
+  }
+  const std::string produced = outputs[0].GetName();
+  const Ort::ConstValueInfo* other = nullptr;
+  int matches = 0;
+  for (const Ort::ConstValueInfo& input : add_inputs) {
+    if (input.GetName() == produced) {
+      ++matches;
+    } else {
+      other = &input;
+    }
+  }
+  if (matches != 1 || other == nullptr) {
+    return false;
+  }
+  if (!SameFloatShape(outputs[0], *other) || !SameFloatShape(outputs[0], add_outputs[0])) {
+    return false;
+  }
+  *add = candidate;
+  return true;
+}
+
+bool ScaleIsPerTensor(const std::vector<int64_t>& scale_shape) { return scale_shape.empty(); }
+
+bool IsFusableDq(const Ort::ConstNode& dq) {
+  if (!OnnxDomain(dq.GetDomain()) || dq.GetOperatorType() != "DequantizeLinear") {
+    return false;
+  }
+  for (const Ort::ConstOpAttr& attr : dq.GetAttributes()) {
+    const std::string name = attr.GetName();
+    if (name != "axis" && name != "block_size") {
+      return false;
+    }
+  }
+  int64_t block_size = 0;
+  if (!ReadIntAttr(dq, "block_size", 0, &block_size) || block_size != 0) {
+    return false;
+  }
+  const std::vector<Ort::ConstValueInfo> inputs = LivePorts(dq.GetInputs());
+  const std::vector<Ort::ConstValueInfo> outputs = LivePorts(dq.GetOutputs());
+  if (inputs.size() < 2 || inputs.size() > 3 || outputs.size() != 1) {
+    return false;
+  }
+  std::vector<int64_t> weight_shape;
+  std::vector<int64_t> scale_shape;
+  std::vector<int64_t> out_shape;
+  if (!TensorOf(inputs[0], ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, &weight_shape, false) || weight_shape.size() < 2 ||
+      !inputs[0].IsConstantInitializer()) {
+    return false;
+  }
+  if (!TensorOf(inputs[1], ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &scale_shape, false) ||
+      !inputs[1].IsConstantInitializer()) {
+    return false;
+  }
+  if (!(ScaleIsPerTensor(scale_shape) || scale_shape.size() == 1)) {
+    return false;
+  }
+  if (scale_shape.size() == 1 && !HasAttr(dq, "axis")) {
+    return false;
+  }
+  if (inputs.size() == 3) {
+    std::vector<int64_t> zp_shape;
+    if (!TensorOf(inputs[2], ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, &zp_shape, false) || zp_shape != scale_shape ||
+        !inputs[2].IsConstantInitializer()) {
+      return false;
+    }
+  }
+  if (!FloatShape(outputs[0], &out_shape) || out_shape != weight_shape) {
+    return false;
+  }
+  if (HasAttr(dq, "axis")) {
+    int64_t axis = 0;
+    if (!ReadIntAttr(dq, "axis", 0, &axis)) {
+      return false;
+    }
+    // Graph::Resolve copies the schema default axis=1 onto the node and then
+    // clears proto sync, so a missing axis and an authored axis=1 are the same
+    // OrtOpAttr. A rank-1 scale with that value stays on CPU.
+    if (scale_shape.size() == 1 && axis == 1) {
+      return false;
+    }
+    if (axis < 0) {
+      axis += static_cast<int64_t>(weight_shape.size());
+    }
+    if (axis < 0 || static_cast<size_t>(axis) >= weight_shape.size()) {
+      return false;
+    }
+    if (scale_shape.size() == 1 && scale_shape[0] != weight_shape[static_cast<size_t>(axis)]) {
+      return false;
+    }
   }
   return true;
+}
+
+bool ExactlyOneFusableDq(const Ort::ConstNode& matmul, Ort::ConstNode* dq) {
+  if (matmul.GetOperatorType() != "MatMul") {
+    return false;
+  }
+  int found = 0;
+  Ort::ConstNode match{nullptr};
+  for (const Ort::ConstValueInfo& input : LivePorts(matmul.GetInputs())) {
+    const Ort::ValueInfoConsumerProducerInfo producer = input.GetProducerNode();
+    if (producer.node != nullptr && IsFusableDq(producer.node)) {
+      ++found;
+      match = producer.node;
+    }
+  }
+  if (found != 1) {
+    return false;
+  }
+  *dq = match;
+  return true;
+}
+
+bool ProducerIsReshapeOrTranspose(const Ort::ConstValueInfo& input) {
+  const Ort::ValueInfoConsumerProducerInfo producer = input.GetProducerNode();
+  if (producer.node == nullptr) {
+    return false;
+  }
+  const std::string op = producer.node.GetOperatorType();
+  return OnnxDomain(producer.node.GetDomain()) && (op == "Reshape" || op == "Transpose");
+}
+
+bool PushActivation(const Ort::ConstNode& current, std::vector<const OrtNode*>* group, std::unordered_set<size_t>* claimed,
+                    Ort::ConstNode* current_out, bool* activated) {
+  Ort::ConstNode activation{nullptr};
+  if (FollowingRelu(current, &activation) || FollowingGelu(current, &activation)) {
+    if (claimed->count(activation.GetId()) != 0) {
+      return true;
+    }
+    group->push_back(activation);
+    claimed->insert(activation.GetId());
+    *current_out = activation;
+    *activated = true;
+  }
+  return true;
+}
+
+void RememberRuntime(std::vector<std::string>* names, const StepInput& input) {
+  if (input.constant || input.produced) {
+    return;
+  }
+  for (const std::string& existing : *names) {
+    if (existing == input.name) {
+      return;
+    }
+  }
+  names->push_back(input.name);
 }
 
 OrtStatus* SaveConstant(AccelEp& ep, const Ort::ConstValueInfo& input, bool* is_constant) {
@@ -339,101 +804,594 @@ OrtStatus* SaveConstant(AccelEp& ep, const Ort::ConstValueInfo& input, bool* is_
   return nullptr;
 }
 
+OrtStatus* UploadDequantized(AccelEp& ep, const Ort::ConstNode& dq, const std::string& dest_name) {
+  if (ep.FindWeight(dest_name) != nullptr) {
+    return nullptr;
+  }
+  if (!IsFusableDq(dq)) {
+    return Fail(ep.api, "AccelEP DequantizeLinear is not a constant int8 weight");
+  }
+  const std::vector<Ort::ConstValueInfo> inputs = LivePorts(dq.GetInputs());
+  Ort::ConstValue weight{nullptr};
+  Ort::ConstValue scale{nullptr};
+  Ort::ConstValue zero_point{nullptr};
+  Ort::Status weight_status = inputs[0].GetInitializer(weight);
+  Ort::Status scale_status = inputs[1].GetInitializer(scale);
+  if (!weight_status.IsOK()) {
+    return weight_status.release();
+  }
+  if (!scale_status.IsOK()) {
+    return scale_status.release();
+  }
+  const bool has_zp = inputs.size() == 3;
+  if (has_zp) {
+    Ort::Status zp_status = inputs[2].GetInitializer(zero_point);
+    if (!zp_status.IsOK()) {
+      return zp_status.release();
+    }
+  }
+  const std::vector<int64_t> weight_shape = weight.GetTensorTypeAndShapeInfo().GetShape();
+  const std::vector<int64_t> scale_shape = scale.GetTensorTypeAndShapeInfo().GetShape();
+  const int64_t count = accel::ElementCount(weight_shape);
+  const int8_t* weight_data = count == 0 ? nullptr : weight.GetTensorData<int8_t>();
+  const float* scale_data = scale.GetTensorData<float>();
+  const int8_t* zp_data = has_zp ? zero_point.GetTensorData<int8_t>() : nullptr;
+  int64_t axis = 0;
+  if (HasAttr(dq, "axis")) {
+    if (!ReadIntAttr(dq, "axis", 0, &axis)) {
+      return Fail(ep.api, "AccelEP could not read DequantizeLinear axis");
+    }
+    if (axis < 0) {
+      axis += static_cast<int64_t>(weight_shape.size());
+    }
+  }
+  std::vector<int64_t> strides(weight_shape.size(), 1);
+  for (size_t dim = weight_shape.size(); dim-- > 1;) {
+    strides[dim - 1] = strides[dim] * weight_shape[dim];
+  }
+  std::vector<float> decoded(static_cast<size_t>(count), 0.f);
+  for (int64_t index = 0; index < count; ++index) {
+    float scale_value = scale_data[0];
+    float zero = 0.f;
+    if (!ScaleIsPerTensor(scale_shape)) {
+      const int64_t coord = (index / strides[static_cast<size_t>(axis)]) % weight_shape[static_cast<size_t>(axis)];
+      scale_value = scale_data[coord];
+      if (zp_data != nullptr) {
+        zero = static_cast<float>(zp_data[coord]);
+      }
+    } else if (zp_data != nullptr) {
+      zero = static_cast<float>(zp_data[0]);
+    }
+    decoded[static_cast<size_t>(index)] = (static_cast<float>(weight_data[index]) - zero) * scale_value;
+  }
+  ep.weights.emplace(dest_name, accel::Upload(*ep.device, decoded.empty() ? nullptr : decoded.data(), weight_shape));
+  return nullptr;
+}
+
+struct SubNode {
+  Ort::ConstNode node;
+  std::string op;
+  std::string domain;
+  std::vector<std::string> inputs;
+  std::vector<std::string> outputs;
+};
+
+std::unordered_map<std::string, size_t> OutputIndex(const std::vector<SubNode>& nodes) {
+  std::unordered_map<std::string, size_t> index;
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    for (const std::string& name : nodes[i].outputs) {
+      index.emplace(name, i);
+    }
+  }
+  return index;
+}
+
+int FindConsumer(const std::vector<SubNode>& nodes, const std::string& produced, size_t self) {
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (i == self) {
+      continue;
+    }
+    for (const std::string& input : nodes[i].inputs) {
+      if (input == produced) {
+        return static_cast<int>(i);
+      }
+    }
+  }
+  return -1;
+}
+
+OrtStatus* BindExternal(AccelEp& ep, const SubNode& matrix, const std::string& name, const std::vector<SubNode>& nodes,
+                        StepInput* input) {
+  input->name = name;
+  const auto produced = OutputIndex(nodes);
+  auto it = produced.find(name);
+  if (it != produced.end() && nodes[it->second].op == "DequantizeLinear") {
+    OrtStatus* status = UploadDequantized(ep, nodes[it->second].node, name);
+    if (status != nullptr) {
+      return status;
+    }
+    input->constant = true;
+    const accel::OwnedBuffer* weight = ep.FindWeight(name);
+    if (weight == nullptr) {
+      return Fail(ep.api, "AccelEP missed a dequantized weight");
+    }
+    input->profile_shape = weight->shape;
+    return nullptr;
+  }
+  const std::vector<Ort::ConstValueInfo> ports = LivePorts(matrix.node.GetInputs());
+  const Ort::ConstValueInfo* port = nullptr;
+  for (const Ort::ConstValueInfo& candidate : ports) {
+    if (candidate.GetName() == name) {
+      port = &candidate;
+      break;
+    }
+  }
+  if (port == nullptr) {
+    return Fail(ep.api, "AccelEP lost track of a compiled input");
+  }
+  bool constant = false;
+  OrtStatus* status = SaveConstant(ep, *port, &constant);
+  if (status != nullptr) {
+    return status;
+  }
+  input->constant = constant;
+  std::vector<int64_t> shape;
+  if (FloatShape(*port, &shape)) {
+    input->profile_shape = std::move(shape);
+  }
+  return nullptr;
+}
+
+OrtStatus* MaybePretranspose(AccelEp& ep, StepInput* input, bool trans) {
+  if (!trans || !input->constant || input->produced) {
+    return nullptr;
+  }
+  const accel::OwnedBuffer* weight = ep.FindWeight(input->name);
+  if (weight == nullptr) {
+    return Fail(ep.api, "AccelEP is missing device weight " + input->name);
+  }
+  if (ep.FindTransposed(input->name) == nullptr) {
+    accel::OwnedBuffer transposed;
+    accel::PretransposeLastTwo(*ep.device, *weight, &transposed);
+    ep.transposed_weights.emplace(input->name, std::move(transposed));
+  }
+  input->pretransposed = true;
+  return nullptr;
+}
+
+OrtStatus* CompileGraph(AccelEp& ep, const Ort::ConstGraph& graph, std::unique_ptr<CompiledKernel>* out_kernel) {
+  const std::vector<Ort::ConstNode> raw_nodes = graph.GetNodes();
+  if (raw_nodes.empty()) {
+    return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+  }
+  std::vector<SubNode> nodes;
+  nodes.reserve(raw_nodes.size());
+  for (const Ort::ConstNode& node : raw_nodes) {
+    SubNode parsed;
+    parsed.node = node;
+    parsed.op = node.GetOperatorType();
+    parsed.domain = node.GetDomain();
+    for (const Ort::ConstValueInfo& input : LivePorts(node.GetInputs())) {
+      parsed.inputs.push_back(input.GetName());
+    }
+    for (const Ort::ConstValueInfo& output : LivePorts(node.GetOutputs())) {
+      parsed.outputs.push_back(output.GetName());
+    }
+    const bool known = parsed.op == "MatMul" || parsed.op == "Gemm" || parsed.op == "FusedMatMul" ||
+                       parsed.op == "Relu" || parsed.op == "Gelu" || parsed.op == "Add" ||
+                       parsed.op == "DequantizeLinear";
+    if (!known) {
+      return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+    }
+    nodes.push_back(std::move(parsed));
+  }
+
+  if (nodes.size() == 1 && nodes[0].op == "MatMul") {
+    MatrixInfo info;
+    DynInfo dyn;
+    if (!MatchMatrix(nodes[0].node, &info) && MatchLeading(nodes[0].node, &dyn)) {
+      auto kernel = std::make_unique<CompiledKernel>();
+      kernel->leading_dynamic = true;
+      kernel->dyn_a_tail = dyn.a_tail;
+      kernel->dyn_b_shape = dyn.b_shape;
+      kernel->dyn_y_tail = dyn.y_tail;
+      CompiledStep step;
+      step.kind = OpKind::MatMul;
+      step.output_name = dyn.output_name;
+      step.activation = accel::Activation::None;
+      for (size_t i = 0; i < dyn.names.size(); ++i) {
+        StepInput input;
+        OrtStatus* status = BindExternal(ep, nodes[0], dyn.names[i], nodes, &input);
+        if (status != nullptr) {
+          return status;
+        }
+        if (!input.constant) {
+          input.profile_shape = i == 0 ? std::vector<int64_t>{} : dyn.b_shape;
+        }
+        step.inputs.push_back(std::move(input));
+      }
+      RememberRuntime(&kernel->runtime_names, step.inputs[0]);
+      RememberRuntime(&kernel->runtime_names, step.inputs[1]);
+      kernel->steps.push_back(std::move(step));
+      *out_kernel = std::move(kernel);
+      return nullptr;
+    }
+  }
+
+  int root = -1;
+  const auto produced = OutputIndex(nodes);
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (nodes[i].op != "MatMul" && nodes[i].op != "Gemm" && nodes[i].op != "FusedMatMul") {
+      continue;
+    }
+    bool consumes_internal = false;
+    for (const std::string& input : nodes[i].inputs) {
+      auto it = produced.find(input);
+      if (it == produced.end()) {
+        continue;
+      }
+      const std::string& op = nodes[it->second].op;
+      if (op == "MatMul" || op == "Gemm" || op == "FusedMatMul" || op == "Relu" || op == "Gelu" || op == "Add") {
+        consumes_internal = true;
+      }
+    }
+    if (!consumes_internal) {
+      if (root != -1) {
+        return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+      }
+      root = static_cast<int>(i);
+    }
+  }
+  if (root < 0) {
+    return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+  }
+
+  auto kernel = std::make_unique<CompiledKernel>();
+  std::unordered_set<size_t> used;
+  int cursor = root;
+  std::string previous;
+  int matrices = 0;
+  bool activated = false;
+  while (cursor >= 0) {
+    SubNode& matrix = nodes[static_cast<size_t>(cursor)];
+    MatrixInfo info;
+    if (!MatchMatrix(matrix.node, &info)) {
+      return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+    }
+    used.insert(static_cast<size_t>(cursor));
+    ++matrices;
+    CompiledStep step;
+    step.kind = info.kind;
+    step.gemm = info.gemm;
+    step.fused = info.fused;
+    step.output_name = info.output_name;
+    step.output_shape = info.output_shape;
+    for (size_t i = 0; i < info.names.size(); ++i) {
+      StepInput input;
+      input.name = info.names[i];
+      input.profile_shape = info.shapes[i];
+      if (!previous.empty() && input.name == previous) {
+        input.produced = true;
+      } else {
+        OrtStatus* status = BindExternal(ep, matrix, input.name, nodes, &input);
+        if (status != nullptr) {
+          return status;
+        }
+        if (input.profile_shape.empty()) {
+          input.profile_shape = info.shapes[i];
+        }
+      }
+      step.inputs.push_back(std::move(input));
+    }
+    if (step.kind == OpKind::Gemm || step.kind == OpKind::FusedMatMul) {
+      const bool trans_a = step.kind == OpKind::Gemm ? step.gemm.trans_a : step.fused.trans_a;
+      const bool trans_b = step.kind == OpKind::Gemm ? step.gemm.trans_b : step.fused.trans_b;
+      if (step.inputs.size() >= 1) {
+        OrtStatus* status = MaybePretranspose(ep, &step.inputs[0], trans_a);
+        if (status != nullptr) {
+          return status;
+        }
+        step.clear_trans_a = step.inputs[0].pretransposed;
+      }
+      if (step.inputs.size() >= 2) {
+        OrtStatus* status = MaybePretranspose(ep, &step.inputs[1], trans_b);
+        if (status != nullptr) {
+          return status;
+        }
+        step.clear_trans_b = step.inputs[1].pretransposed;
+      }
+    }
+
+    if (matrix.outputs.size() != 1) {
+      return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+    }
+    const int follower = FindConsumer(nodes, matrix.outputs[0], static_cast<size_t>(cursor));
+    previous = matrix.outputs[0];
+    cursor = -1;
+    if (follower >= 0) {
+      const SubNode& next = nodes[static_cast<size_t>(follower)];
+      if (next.op == "Relu" || next.op == "Gelu") {
+        // The fused subgraph marks its own external output as a graph output.
+        // Validate the epilogue by structure. GetCapability already applied IsGraphOutput.
+        if (!OnnxDomain(next.domain) || next.inputs.size() != 1 || next.outputs.size() != 1 ||
+            next.inputs[0] != matrix.outputs[0]) {
+          return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+        }
+        std::vector<int64_t> activated_shape;
+        const std::vector<Ort::ConstValueInfo> act_outputs = LivePorts(next.node.GetOutputs());
+        if (act_outputs.size() != 1 || !FloatShape(act_outputs[0], &activated_shape) ||
+            activated_shape != step.output_shape) {
+          return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+        }
+        if (next.op == "Gelu") {
+          if (!GeluEpilogueOk(next.node)) {
+            return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+          }
+          step.activation = accel::Activation::Gelu;
+        } else if (!next.node.GetAttributes().empty()) {
+          return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+        } else {
+          step.activation = accel::Activation::Relu;
+        }
+        activated = true;
+        used.insert(static_cast<size_t>(follower));
+        step.output_name = next.outputs[0];
+        step.output_shape = activated_shape;
+        previous = next.outputs[0];
+        const int after = FindConsumer(nodes, next.outputs[0], static_cast<size_t>(follower));
+        if (after >= 0 && (nodes[static_cast<size_t>(after)].op == "MatMul" ||
+                           nodes[static_cast<size_t>(after)].op == "Gemm" ||
+                           nodes[static_cast<size_t>(after)].op == "FusedMatMul")) {
+          cursor = after;
+        } else if (after >= 0) {
+          return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+        }
+      } else if (next.op == "MatMul" || next.op == "Gemm" || next.op == "FusedMatMul") {
+        cursor = follower;
+      } else if (next.op == "Add") {
+        if (matrices != 1 || activated || step.kind != OpKind::MatMul || step.activation != accel::Activation::None ||
+            !OnnxDomain(next.domain) || !next.node.GetAttributes().empty() || next.inputs.size() != 2 ||
+            next.outputs.size() != 1) {
+          return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+        }
+        int matches = 0;
+        std::string residual_name;
+        for (const std::string& input_name : next.inputs) {
+          if (input_name == matrix.outputs[0]) {
+            ++matches;
+          } else {
+            residual_name = input_name;
+          }
+        }
+        const std::vector<Ort::ConstValueInfo> add_inputs = LivePorts(next.node.GetInputs());
+        const std::vector<Ort::ConstValueInfo> add_outputs = LivePorts(next.node.GetOutputs());
+        const std::vector<Ort::ConstValueInfo> produced = LivePorts(matrix.node.GetOutputs());
+        const Ort::ConstValueInfo* other = nullptr;
+        for (const Ort::ConstValueInfo& input : add_inputs) {
+          if (input.GetName() == residual_name) {
+            other = &input;
+          }
+        }
+        if (matches != 1 || residual_name.empty() || other == nullptr || add_outputs.size() != 1 ||
+            produced.size() != 1 || !SameFloatShape(*other, add_outputs[0]) ||
+            !SameFloatShape(produced[0], add_outputs[0])) {
+          return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+        }
+        StepInput residual;
+        OrtStatus* status = BindExternal(ep, next, residual_name, nodes, &residual);
+        if (status != nullptr) {
+          return status;
+        }
+        if (residual.profile_shape.empty()) {
+          residual.profile_shape = step.output_shape;
+        }
+        step.has_residual = true;
+        step.residual = std::move(residual);
+        step.output_name = next.outputs[0];
+        used.insert(static_cast<size_t>(follower));
+      } else {
+        return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+      }
+    }
+    for (const StepInput& input : step.inputs) {
+      RememberRuntime(&kernel->runtime_names, input);
+    }
+    if (step.has_residual) {
+      RememberRuntime(&kernel->runtime_names, step.residual);
+    }
+    kernel->steps.push_back(std::move(step));
+  }
+
+  for (size_t i = 0; i < nodes.size(); ++i) {
+    if (nodes[i].op == "DequantizeLinear") {
+      bool consumed = false;
+      for (const CompiledStep& step : kernel->steps) {
+        for (const StepInput& input : step.inputs) {
+          if (input.constant && !nodes[i].outputs.empty() && input.name == nodes[i].outputs[0]) {
+            consumed = true;
+          }
+        }
+      }
+      if (!consumed) {
+        return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+      }
+      continue;
+    }
+    if (used.count(i) == 0) {
+      return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+    }
+  }
+  if (kernel->steps.empty()) {
+    return Fail(ep.api, "AccelEP was asked to compile an op it did not claim");
+  }
+  *out_kernel = std::move(kernel);
+  return nullptr;
+}
+
+bool BindConstant(AccelEp& ep, const StepInput& input, accel::Operand* operand, std::vector<int64_t>* profile_shape) {
+  const accel::OwnedBuffer* weight = input.pretransposed ? ep.FindTransposed(input.name) : ep.FindWeight(input.name);
+  if (weight == nullptr) {
+    return false;
+  }
+  accel::NoteConstantTouch(weight->buffer.id, weight->buffer.data, weight->buffer.bytes);
+  operand->on_device = weight;
+  operand->shape = weight->shape;
+  *profile_shape = input.profile_shape.empty() ? weight->shape : input.profile_shape;
+  return true;
+}
+
 OrtStatus* RunKernel(AccelEp& ep, const CompiledKernel& kernel, OrtKernelContext* kernel_ctx) {
   Ort::KernelContext context(kernel_ctx);
   const size_t runtime_count = context.GetInputCount();
   if (context.GetOutputCount() != 1) {
     return Fail(ep.api, "AccelEP expected one output");
   }
-
-  std::vector<accel::Operand> operands;
-  operands.reserve(kernel.inputs.size());
-  size_t runtime_index = 0;
-  for (const CompiledInput& input : kernel.inputs) {
-    accel::Operand operand;
-    if (input.constant) {
-      const accel::OwnedBuffer* weight = ep.FindWeight(input.name);
-      if (weight == nullptr) {
-        return Fail(ep.api, "AccelEP is missing device weight " + input.name);
-      }
-      operand.on_device = weight;
-      operand.shape = weight->shape;
-    } else {
-      if (runtime_index >= runtime_count) {
-        return Fail(ep.api, "AccelEP ran out of runtime inputs");
-      }
-      Ort::ConstValue value = context.GetInput(runtime_index++);
-      const auto type_shape = value.GetTensorTypeAndShapeInfo();
-      if (type_shape.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
-        return Fail(ep.api, "AccelEP expected a float32 runtime input");
-      }
-      operand.shape = type_shape.GetShape();
-      operand.host = operand.shape.empty() || accel::ElementCount(operand.shape) == 0
-                         ? nullptr
-                         : value.GetTensorData<float>();
-    }
-    operands.push_back(std::move(operand));
-  }
-  if (runtime_index != runtime_count) {
+  if (kernel.runtime_names.size() != runtime_count) {
     return Fail(ep.api, "AccelEP was given runtime inputs it did not compile");
   }
-
-  std::vector<int64_t> out_shape;
-  bool matched = false;
-  if (kernel.kind == OpKind::MatMul) {
-    matched = accel::InferMatMulShape(operands[0].shape, operands[1].shape, &out_shape);
-  } else if (kernel.kind == OpKind::Gemm) {
-    matched = accel::InferGemmShape(operands[0].shape, kernel.gemm.trans_a, operands[1].shape, kernel.gemm.trans_b,
-                                    operands.size() == 3 ? &operands[2].shape : nullptr, &out_shape);
-  } else {
-    matched = accel::InferFusedMatMulShape(operands[0].shape, kernel.fused.trans_a, operands[1].shape,
-                                           kernel.fused.trans_b, &out_shape);
-  }
-  if (!matched) {
-    return Fail(ep.api, "AccelEP runtime shapes are outside the compiled matrix contract");
+  std::unordered_map<std::string, accel::Operand> fed;
+  for (size_t i = 0; i < kernel.runtime_names.size(); ++i) {
+    Ort::ConstValue value = context.GetInput(i);
+    const auto type_shape = value.GetTensorTypeAndShapeInfo();
+    if (type_shape.GetElementType() != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+      return Fail(ep.api, "AccelEP expected a float32 runtime input");
+    }
+    accel::Operand operand;
+    operand.shape = type_shape.GetShape();
+    operand.host = operand.shape.empty() || accel::ElementCount(operand.shape) == 0 ? nullptr
+                                                                                    : value.GetTensorData<float>();
+    fed.emplace(kernel.runtime_names[i], std::move(operand));
   }
 
-  Ort::UnownedValue output = context.GetOutput(0, out_shape);
-  float* out_data = accel::ElementCount(out_shape) == 0 ? nullptr : output.GetTensorMutableData<float>();
-  if (kernel.kind == OpKind::MatMul) {
-    accel::ExecuteMatMul(*ep.device, operands[0], operands[1], out_data, kernel.relu);
-  } else if (kernel.kind == OpKind::Gemm) {
-    const accel::Operand* bias = operands.size() == 3 ? &operands[2] : nullptr;
-    accel::ExecuteGemm(*ep.device, operands[0], operands[1], bias, kernel.gemm, out_data, kernel.relu);
-  } else {
-    accel::ExecuteFusedMatMul(*ep.device, operands[0], operands[1], kernel.fused, kernel.relu, out_data);
+  accel::OwnedBuffer retained;
+  std::string retained_name;
+  for (size_t step_index = 0; step_index < kernel.steps.size(); ++step_index) {
+    const CompiledStep& step = kernel.steps[step_index];
+    const bool last = step_index + 1 == kernel.steps.size();
+    std::vector<accel::Operand> operands;
+    accel::ProfileRecord record;
+    record.op = OpName(step.kind);
+    record.activation = accel::ActivationName(step.activation);
+    operands.reserve(step.inputs.size());
+    for (const StepInput& input : step.inputs) {
+      accel::Operand operand;
+      std::vector<int64_t> shown;
+      if (input.produced) {
+        if (retained_name != input.name || retained.device == nullptr) {
+          return Fail(ep.api, "AccelEP lost a device-resident activation");
+        }
+        operand.on_device = &retained;
+        operand.shape = retained.shape;
+        shown = retained.shape;
+      } else if (input.constant) {
+        if (!BindConstant(ep, input, &operand, &shown)) {
+          return Fail(ep.api, input.pretransposed ? "AccelEP is missing a pretransposed weight " + input.name
+                                                  : "AccelEP is missing device weight " + input.name);
+        }
+      } else {
+        auto it = fed.find(input.name);
+        if (it == fed.end()) {
+          return Fail(ep.api, "AccelEP ran out of runtime inputs");
+        }
+        operand = it->second;
+        shown = operand.shape;
+      }
+      record.inputs.push_back(accel::ProfileTensor{input.name, shown});
+      operands.push_back(std::move(operand));
+    }
+
+    accel::Operand residual_operand;
+    const accel::Operand* residual = nullptr;
+    if (step.has_residual) {
+      std::vector<int64_t> shown;
+      if (step.residual.constant) {
+        if (!BindConstant(ep, step.residual, &residual_operand, &shown)) {
+          return Fail(ep.api, "AccelEP is missing device weight " + step.residual.name);
+        }
+      } else {
+        auto it = fed.find(step.residual.name);
+        if (it == fed.end()) {
+          return Fail(ep.api, "AccelEP ran out of runtime inputs");
+        }
+        residual_operand = it->second;
+        shown = residual_operand.shape;
+      }
+      record.inputs.push_back(accel::ProfileTensor{step.residual.name, shown});
+      residual = &residual_operand;
+    }
+
+    if (kernel.leading_dynamic) {
+      if (operands.size() != 2 || operands[0].shape.size() != kernel.dyn_a_tail.size() + 1 ||
+          operands[0].shape[0] < 0 || operands[1].shape != kernel.dyn_b_shape) {
+        return Fail(ep.api, "AccelEP runtime shapes are outside the compiled matrix contract");
+      }
+      for (size_t i = 0; i < kernel.dyn_a_tail.size(); ++i) {
+        if (operands[0].shape[i + 1] != kernel.dyn_a_tail[i]) {
+          return Fail(ep.api, "AccelEP runtime shapes are outside the compiled matrix contract");
+        }
+      }
+    }
+
+    std::vector<int64_t> out_shape;
+    bool matched = false;
+    accel::GemmConfig gemm = step.gemm;
+    accel::FusedMatMulConfig fused = step.fused;
+    if (step.clear_trans_a) {
+      gemm.trans_a = false;
+      fused.trans_a = false;
+    }
+    if (step.clear_trans_b) {
+      gemm.trans_b = false;
+      fused.trans_b = false;
+    }
+    if (step.kind == OpKind::MatMul) {
+      matched = accel::InferMatMulShape(operands[0].shape, operands[1].shape, &out_shape);
+    } else if (step.kind == OpKind::Gemm) {
+      matched = accel::InferGemmShape(operands[0].shape, gemm.trans_a, operands[1].shape, gemm.trans_b,
+                                      operands.size() == 3 ? &operands[2].shape : nullptr, &out_shape);
+    } else {
+      matched = accel::InferFusedMatMulShape(operands[0].shape, fused.trans_a, operands[1].shape, fused.trans_b,
+                                             &out_shape);
+    }
+    if (!matched) {
+      return Fail(ep.api, "AccelEP runtime shapes are outside the compiled matrix contract");
+    }
+    if (kernel.leading_dynamic) {
+      if (out_shape.empty() || out_shape[0] != operands[0].shape[0] ||
+          out_shape.size() != kernel.dyn_y_tail.size() + 1) {
+        return Fail(ep.api, "AccelEP runtime shapes are outside the compiled matrix contract");
+      }
+      for (size_t i = 0; i < kernel.dyn_y_tail.size(); ++i) {
+        if (out_shape[i + 1] != kernel.dyn_y_tail[i]) {
+          return Fail(ep.api, "AccelEP runtime shapes are outside the compiled matrix contract");
+        }
+      }
+    }
+
+    float* out_data = nullptr;
+    if (last) {
+      Ort::UnownedValue output = context.GetOutput(0, out_shape);
+      out_data = accel::ElementCount(out_shape) == 0 ? nullptr : output.GetTensorMutableData<float>();
+    }
+    record.output.name = step.output_name;
+    record.output.shape = out_shape;
+    const accel::AcceleratorStats before = accel::GetAcceleratorStats();
+    accel::OwnedBuffer* retain = last ? nullptr : &retained;
+    if (step.kind == OpKind::MatMul) {
+      accel::ExecuteMatMul(*ep.device, operands[0], operands[1], out_data, step.activation, residual, retain);
+    } else if (step.kind == OpKind::Gemm) {
+      const accel::Operand* bias = operands.size() == 3 ? &operands[2] : nullptr;
+      accel::ExecuteGemm(*ep.device, operands[0], operands[1], bias, gemm, out_data, step.activation, retain);
+    } else {
+      accel::ExecuteFusedMatMul(*ep.device, operands[0], operands[1], fused, step.activation, out_data, retain);
+    }
+    const accel::AcceleratorStats after = accel::GetAcceleratorStats();
+    record.bytes_to_device = after.bytes_to_device - before.bytes_to_device;
+    record.bytes_to_host = after.bytes_to_host - before.bytes_to_host;
+    accel::AppendProfileRecord(std::move(record));
+    retained_name = step.output_name;
   }
   return nullptr;
-}
-
-bool FollowingRelu(const Ort::ConstNode& node, Ort::ConstNode* relu) {
-  const std::vector<Ort::ConstValueInfo> outputs = node.GetOutputs();
-  if (outputs.size() != 1 || outputs[0] == nullptr || outputs[0].IsGraphOutput()) {
-    return false;
-  }
-  const std::vector<Ort::ValueInfoConsumerProducerInfo> consumers = outputs[0].GetConsumers();
-  if (consumers.size() != 1 || consumers[0].index != 0 || consumers[0].node == nullptr) {
-    return false;
-  }
-  const Ort::ConstNode& candidate = consumers[0].node;
-  if (!OnnxDomain(candidate.GetDomain()) || candidate.GetOperatorType() != "Relu") {
-    return false;
-  }
-  const std::vector<Ort::ConstValueInfo> relu_inputs = candidate.GetInputs();
-  const std::vector<Ort::ConstValueInfo> relu_outputs = candidate.GetOutputs();
-  if (relu_inputs.size() != 1 || relu_outputs.size() != 1 || relu_inputs[0] == nullptr || relu_outputs[0] == nullptr) {
-    return false;
-  }
-  if (relu_inputs[0].GetName() != outputs[0].GetName()) {
-    return false;
-  }
-  std::vector<int64_t> produced;
-  std::vector<int64_t> activated;
-  if (!FloatShape(outputs[0], &produced) || !FloatShape(relu_outputs[0], &activated) || produced != activated) {
-    return false;
-  }
-  *relu = candidate;
-  return true;
 }
 
 OrtStatus* AccelEp::GetCapabilityImpl(OrtEp* self, const OrtGraph* ort_graph,
@@ -443,8 +1401,6 @@ OrtStatus* AccelEp::GetCapabilityImpl(OrtEp* self, const OrtGraph* ort_graph,
     const Ort::ConstGraph graph{ort_graph};
     OrtNodeFusionOptions options{};
     options.ort_version_supported = ORT_API_VERSION;
-    // Weights are copied onto the device during Compile, so ORT can drop them
-    // from the fused node. Activations stay as runtime inputs.
     options.drop_constant_initializers = true;
 
     std::unordered_set<size_t> claimed;
@@ -452,22 +1408,65 @@ OrtStatus* AccelEp::GetCapabilityImpl(OrtEp* self, const OrtGraph* ort_graph,
       if (claimed.count(node.GetId()) != 0) {
         continue;
       }
-      CompiledKernel kernel;
-      if (!MatchNode(node, &kernel)) {
+      MatrixInfo info;
+      DynInfo dyn;
+      const bool is_static = MatchMatrix(node, &info);
+      const bool is_dynamic = !is_static && MatchLeading(node, &dyn);
+      if (!is_static && !is_dynamic) {
         continue;
       }
-      // A following Relu joins this matrix op. The product stays on the device
-      // and GemmEpilogue applies the activation. Every other op stays on the CPU EP.
-      Ort::ConstNode relu{nullptr};
-      const OrtNode* raw[2] = {node, nullptr};
-      size_t count = 1;
-      if (FollowingRelu(node, &relu)) {
-        raw[1] = relu;
-        count = 2;
-        claimed.insert(relu.GetId());
+      if (UnsupportedGeluConsumer(node)) {
+        continue;
       }
-      claimed.insert(node.GetId());
-      OrtStatus* status = ep->ep_api.EpGraphSupportInfo_AddNodesToFuse(graph_support_info, raw, count, &options);
+      std::vector<const OrtNode*> group;
+      if (is_dynamic) {
+        const std::vector<Ort::ConstValueInfo> inputs = LivePorts(node.GetInputs());
+        if (!inputs.empty() && ProducerIsReshapeOrTranspose(inputs[0])) {
+          continue;
+        }
+        group.push_back(node);
+        claimed.insert(node.GetId());
+      } else {
+        Ort::ConstNode dq{nullptr};
+        if (info.kind == OpKind::MatMul && ExactlyOneFusableDq(node, &dq) && claimed.count(dq.GetId()) == 0) {
+          group.push_back(dq);
+          claimed.insert(dq.GetId());
+        }
+        group.push_back(node);
+        claimed.insert(node.GetId());
+        Ort::ConstNode current = node;
+        bool activated = false;
+        int matrices = 1;
+        if (!PushActivation(current, &group, &claimed, &current, &activated)) {
+          continue;
+        }
+        while (true) {
+          Ort::ConstNode next{nullptr};
+          if (!SoleConsumer(current, &next) || claimed.count(next.GetId()) != 0) {
+            break;
+          }
+          MatrixInfo next_info;
+          if (!MatchMatrix(next, &next_info) || !OtherInputsAreConstant(current, next)) {
+            break;
+          }
+          group.push_back(next);
+          claimed.insert(next.GetId());
+          current = next;
+          ++matrices;
+          if (!PushActivation(current, &group, &claimed, &current, &activated)) {
+            break;
+          }
+        }
+        if (matrices == 1 && !activated && info.kind == OpKind::MatMul) {
+          Ort::ConstNode add{nullptr};
+          if (FollowingAdd(node, &add) && claimed.count(add.GetId()) == 0) {
+            group.push_back(add);
+            claimed.insert(add.GetId());
+          }
+        }
+      }
+      OrtStatus* status =
+          ep->ep_api.EpGraphSupportInfo_AddNodesToFuse(graph_support_info, group.data(), group.size(), &options);
       if (status != nullptr) {
         return status;
       }
@@ -486,60 +1485,11 @@ OrtStatus* AccelEp::CompileImpl(OrtEp* self, const OrtGraph** graphs, const OrtN
     auto* ep = static_cast<AccelEp*>(self);
     for (size_t i = 0; i < count; ++i) {
       const Ort::ConstGraph graph{graphs[i]};
-      const std::vector<Ort::ConstNode> nodes = graph.GetNodes();
-      if (nodes.empty() || nodes.size() > 2) {
-        return Fail(ep->api, "AccelEP compiles one matrix op, optionally followed by Relu");
+      std::unique_ptr<CompiledKernel> kernel;
+      OrtStatus* status = CompileGraph(*ep, graph, &kernel);
+      if (status != nullptr) {
+        return status;
       }
-      Ort::ConstNode compute{nullptr};
-      Ort::ConstNode relu{nullptr};
-      for (const Ort::ConstNode& node : nodes) {
-        if (OnnxDomain(node.GetDomain()) && node.GetOperatorType() == "Relu") {
-          if (relu != nullptr) {
-            return Fail(ep->api, "AccelEP was asked to compile more than one Relu");
-          }
-          relu = node;
-        } else {
-          if (compute != nullptr) {
-            return Fail(ep->api, "AccelEP was asked to compile more than one matrix op");
-          }
-          compute = node;
-        }
-      }
-      const bool grouped = (nodes.size() == 1 && relu == nullptr) || (nodes.size() == 2 && relu != nullptr);
-      if (compute == nullptr || !grouped) {
-        return Fail(ep->api, "AccelEP was asked to compile an op it did not claim");
-      }
-      auto kernel = std::make_unique<CompiledKernel>();
-      if (!MatchNode(compute, kernel.get())) {
-        return Fail(ep->api, "AccelEP was asked to compile an op it did not claim");
-      }
-      if (relu != nullptr) {
-        const std::vector<Ort::ConstValueInfo> produced = compute.GetOutputs();
-        const std::vector<Ort::ConstValueInfo> activated = relu.GetInputs();
-        if (produced.size() != 1 || activated.size() != 1 || produced[0].GetName() != activated[0].GetName()) {
-          return Fail(ep->api, "AccelEP Relu is not the consumer of the matrix op");
-        }
-        kernel->relu = true;
-      }
-
-      std::vector<Ort::ConstValueInfo> inputs = compute.GetInputs();
-      size_t recorded = 0;
-      for (const Ort::ConstValueInfo& input : inputs) {
-        if (input == nullptr || input.GetName().empty()) {
-          continue;
-        }
-        if (recorded >= kernel->inputs.size() || kernel->inputs[recorded].name != input.GetName()) {
-          return Fail(ep->api, "AccelEP lost track of a compiled input");
-        }
-        bool is_constant = false;
-        OrtStatus* status = SaveConstant(*ep, input, &is_constant);
-        if (status != nullptr) {
-          return status;
-        }
-        kernel->inputs[recorded].constant = is_constant;
-        ++recorded;
-      }
-
       const std::string fused_name = Ort::ConstNode{fused_nodes[i]}.GetName();
       ep->kernels.emplace(fused_name, std::move(kernel));
       node_compute_infos[i] = new NodeComputeInfo(*ep);
@@ -571,7 +1521,8 @@ OrtStatus* NodeComputeInfo::CreateStateImpl(OrtNodeComputeInfo* self, OrtNodeCom
   return nullptr;
 }
 
-OrtStatus* NodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* self, void* compute_state, OrtKernelContext* kernel_context) {
+OrtStatus* NodeComputeInfo::ComputeImpl(OrtNodeComputeInfo* self, void* compute_state,
+                                        OrtKernelContext* kernel_context) {
   try {
     auto* info = static_cast<NodeComputeInfo*>(self);
     return RunKernel(info->ep, *static_cast<const CompiledKernel*>(compute_state), kernel_context);
@@ -599,7 +1550,6 @@ OrtStatus* AccelEpFactory::GetSupportedDevicesImpl(OrtEpFactory* self, const Ort
         return status;
       }
       ep_devices[(*num_ep_devices)++] = ep_device;
-      // One CPU device is enough for this simulator.
       break;
     }
     return nullptr;
@@ -657,7 +1607,18 @@ ACCEL_EXPORT int64_t AccelEpMatmulOps() { return accel::GetAcceleratorStats().ma
 ACCEL_EXPORT int64_t AccelEpGemmOps() { return accel::GetAcceleratorStats().gemm_ops; }
 ACCEL_EXPORT int64_t AccelEpKernelMatmuls() { return accel::GetAcceleratorStats().kernel_matmuls; }
 ACCEL_EXPORT int64_t AccelEpReluEpilogues() { return accel::GetAcceleratorStats().relu_epilogues; }
+ACCEL_EXPORT int64_t AccelEpGeluEpilogues() { return accel::GetAcceleratorStats().gelu_epilogues; }
+ACCEL_EXPORT int64_t AccelEpAddEpilogues() { return accel::GetAcceleratorStats().add_epilogues; }
+ACCEL_EXPORT int64_t AccelEpDeviceTransposes() { return accel::GetAcceleratorStats().device_transposes; }
 ACCEL_EXPORT int64_t AccelEpBytesToDevice() { return accel::GetAcceleratorStats().bytes_to_device; }
 ACCEL_EXPORT int64_t AccelEpBytesToHost() { return accel::GetAcceleratorStats().bytes_to_host; }
+ACCEL_EXPORT int AccelEpWriteProfile(const char* path) { return accel::WriteProfile(path); }
+ACCEL_EXPORT int AccelEpIsStreamAware() { return static_cast<int>(kAccelEpStreamAware); }
+ACCEL_EXPORT int64_t AccelEpLiveDeviceAllocs() { return accel::LiveDeviceAllocs(); }
+ACCEL_EXPORT void AccelEpClearConstantTouches() { accel::ClearConstantTouches(); }
+ACCEL_EXPORT int64_t AccelEpConstantTouchCount() { return accel::ConstantTouchCount(); }
+ACCEL_EXPORT uint64_t AccelEpConstantTouchId(int64_t index) { return accel::ConstantTouchId(index); }
+ACCEL_EXPORT uint64_t AccelEpConstantTouchAddress(int64_t index) { return accel::ConstantTouchAddress(index); }
+ACCEL_EXPORT uint64_t AccelEpConstantTouchBytes(int64_t index) { return accel::ConstantTouchBytes(index); }
 
 }  // extern "C"

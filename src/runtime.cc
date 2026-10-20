@@ -1,7 +1,10 @@
 #include "accel/runtime.h"
 
 #include <atomic>
+#include <cmath>
+#include <fstream>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 #include <utility>
 
@@ -13,6 +16,9 @@ struct Stats {
   std::atomic<int64_t> gemm_ops{0};
   std::atomic<int64_t> kernel_matmuls{0};
   std::atomic<int64_t> relu_epilogues{0};
+  std::atomic<int64_t> gelu_epilogues{0};
+  std::atomic<int64_t> add_epilogues{0};
+  std::atomic<int64_t> device_transposes{0};
   std::atomic<int64_t> bytes_to_device{0};
   std::atomic<int64_t> bytes_to_host{0};
 };
@@ -22,8 +28,27 @@ Stats& GlobalStats() {
   return stats;
 }
 
-bool BroadcastShapes(const std::vector<int64_t>& a, const std::vector<int64_t>& b,
-                     std::vector<int64_t>* out) {
+std::mutex& ProfileMu() {
+  static std::mutex mu;
+  return mu;
+}
+
+std::vector<ProfileRecord>& ProfileLog() {
+  static std::vector<ProfileRecord> log;
+  return log;
+}
+
+std::mutex& TouchMu() {
+  static std::mutex mu;
+  return mu;
+}
+
+std::vector<ConstantTouch>& TouchLog() {
+  static std::vector<ConstantTouch> log;
+  return log;
+}
+
+bool BroadcastShapes(const std::vector<int64_t>& a, const std::vector<int64_t>& b, std::vector<int64_t>* out) {
   const size_t n = a.size() > b.size() ? a.size() : b.size();
   out->assign(n, 1);
   for (size_t i = 0; i < n; ++i) {
@@ -113,11 +138,12 @@ DeviceBuffer Resolve(Device& device, const Operand& op, OwnedBuffer* uploaded) {
 DeviceBuffer Slice(DeviceBuffer base, int64_t elem_offset, int64_t elems) {
   auto* origin = static_cast<float*>(base.data);
   // A zero-element tensor still has a non-null allocation, so the pointer stays valid.
-  return DeviceBuffer{origin + elem_offset, static_cast<size_t>(elems) * sizeof(float)};
+  // Slices do not own an allocation id.
+  return DeviceBuffer{origin + elem_offset, static_cast<size_t>(elems) * sizeof(float), 0};
 }
 
-void GemmDims(const std::vector<int64_t>& a, bool trans_a, const std::vector<int64_t>& b, bool trans_b,
-              int64_t* m, int64_t* k, int64_t* n) {
+void GemmDims(const std::vector<int64_t>& a, bool trans_a, const std::vector<int64_t>& b, bool trans_b, int64_t* m,
+              int64_t* k, int64_t* n) {
   *m = trans_a ? a[1] : a[0];
   *k = trans_a ? a[0] : a[1];
   *n = trans_b ? b[0] : b[1];
@@ -131,136 +157,100 @@ bool SwapLastTwo(std::vector<int64_t>* shape) {
   return true;
 }
 
-}  // namespace
-
-void ResetAcceleratorStats() {
-  Stats& stats = GlobalStats();
-  stats.matmul_ops.store(0);
-  stats.gemm_ops.store(0);
-  stats.kernel_matmuls.store(0);
-  stats.relu_epilogues.store(0);
-  stats.bytes_to_device.store(0);
-  stats.bytes_to_host.store(0);
+void NoteActivation(Activation activation) {
+  if (activation == Activation::Relu) {
+    NoteReluEpilogue();
+  } else if (activation == Activation::Gelu) {
+    NoteGeluEpilogue();
+  }
 }
 
-AcceleratorStats GetAcceleratorStats() {
-  const Stats& stats = GlobalStats();
-  AcceleratorStats out;
-  out.matmul_ops = stats.matmul_ops.load();
-  out.gemm_ops = stats.gemm_ops.load();
-  out.kernel_matmuls = stats.kernel_matmuls.load();
-  out.relu_epilogues = stats.relu_epilogues.load();
-  out.bytes_to_device = stats.bytes_to_device.load();
-  out.bytes_to_host = stats.bytes_to_host.load();
+void Deliver(Device& device, OwnedBuffer* out, int64_t out_count, float* out_host, OwnedBuffer* retain) {
+  if (retain != nullptr) {
+    retain->Reset();
+    *retain = std::move(*out);
+    return;
+  }
+  if (out_count > 0) {
+    device.CopyDeviceToHost(out_host, out->buffer, static_cast<size_t>(out_count) * sizeof(float));
+  }
+}
+
+std::string JsonEscape(const std::string& text) {
+  std::string out;
+  out.reserve(text.size() + 2);
+  for (unsigned char ch : text) {
+    switch (ch) {
+      case '"':
+        out += "\\\"";
+        break;
+      case '\\':
+        out += "\\\\";
+        break;
+      default:
+        out.push_back(static_cast<char>(ch));
+        break;
+    }
+  }
   return out;
 }
 
-void NoteMatmulOp() { GlobalStats().matmul_ops.fetch_add(1); }
-void NoteGemmOp() { GlobalStats().gemm_ops.fetch_add(1); }
-void NoteKernelMatmul() { GlobalStats().kernel_matmuls.fetch_add(1); }
-void NoteReluEpilogue() { GlobalStats().relu_epilogues.fetch_add(1); }
-void NoteBytesToDevice(size_t bytes) {
-  GlobalStats().bytes_to_device.fetch_add(static_cast<int64_t>(bytes));
-}
-void NoteBytesToHost(size_t bytes) {
-  GlobalStats().bytes_to_host.fetch_add(static_cast<int64_t>(bytes));
-}
-
-int64_t ElementCount(const std::vector<int64_t>& shape) {
-  int64_t count = 1;
-  for (int64_t dim : shape) {
-    if (dim < 0) {
-      throw std::invalid_argument("dynamic dimension");
+std::string ShapeJson(const std::vector<int64_t>& shape) {
+  std::string out = "[";
+  for (size_t i = 0; i < shape.size(); ++i) {
+    if (i != 0) {
+      out += ',';
     }
-    if (dim != 0 && count > std::numeric_limits<int64_t>::max() / dim) {
-      throw std::overflow_error("tensor is too large");
+    out += std::to_string(shape[i]);
+  }
+  out += ']';
+  return out;
+}
+
+std::string ProfileJson() {
+  std::lock_guard<std::mutex> lock(ProfileMu());
+  const std::vector<ProfileRecord>& log = ProfileLog();
+  if (log.empty()) {
+    return "{\"records\":[]}";
+  }
+  std::string out = "{\"records\":[";
+  for (size_t r = 0; r < log.size(); ++r) {
+    const ProfileRecord& rec = log[r];
+    if (r != 0) {
+      out += ',';
     }
-    count *= dim;
+    out += "{\"op\":\"";
+    out += JsonEscape(rec.op);
+    out += "\",\"activation\":\"";
+    out += JsonEscape(rec.activation);
+    out += "\",\"inputs\":[";
+    for (size_t i = 0; i < rec.inputs.size(); ++i) {
+      if (i != 0) {
+        out += ',';
+      }
+      out += "{\"name\":\"";
+      out += JsonEscape(rec.inputs[i].name);
+      out += "\",\"shape\":";
+      out += ShapeJson(rec.inputs[i].shape);
+      out += '}';
+    }
+    out += "],\"output\":{\"name\":\"";
+    out += JsonEscape(rec.output.name);
+    out += "\",\"shape\":";
+    out += ShapeJson(rec.output.shape);
+    out += "},\"bytes_to_device\":";
+    out += std::to_string(rec.bytes_to_device);
+    out += ",\"bytes_to_host\":";
+    out += std::to_string(rec.bytes_to_host);
+    out += '}';
   }
-  return count;
+  out += "]}";
+  return out;
 }
 
-bool InferMatMulShape(const std::vector<int64_t>& a, const std::vector<int64_t>& b,
-                      std::vector<int64_t>* out) {
-  if (out == nullptr || a.size() < 2 || b.size() < 2) {
-    return false;
-  }
-  for (int64_t dim : a) {
-    if (dim < 0) return false;
-  }
-  for (int64_t dim : b) {
-    if (dim < 0) return false;
-  }
-  if (a.back() != b[b.size() - 2]) {
-    return false;
-  }
-  const std::vector<int64_t> a_batch(a.begin(), a.end() - 2);
-  const std::vector<int64_t> b_batch(b.begin(), b.end() - 2);
-  std::vector<int64_t> batch;
-  if (!BroadcastShapes(a_batch, b_batch, &batch)) {
-    return false;
-  }
-  batch.push_back(a[a.size() - 2]);
-  batch.push_back(b.back());
-  *out = std::move(batch);
-  return true;
-}
-
-bool InferFusedMatMulShape(const std::vector<int64_t>& a, bool trans_a, const std::vector<int64_t>& b,
-                           bool trans_b, std::vector<int64_t>* out) {
-  std::vector<int64_t> a_logical = a;
-  std::vector<int64_t> b_logical = b;
-  if (trans_a && !SwapLastTwo(&a_logical)) {
-    return false;
-  }
-  if (trans_b && !SwapLastTwo(&b_logical)) {
-    return false;
-  }
-  return InferMatMulShape(a_logical, b_logical, out);
-}
-
-bool InferGemmShape(const std::vector<int64_t>& a, bool trans_a, const std::vector<int64_t>& b, bool trans_b,
-                    const std::vector<int64_t>* bias, std::vector<int64_t>* out) {
-  if (out == nullptr || a.size() != 2 || b.size() != 2) {
-    return false;
-  }
-  for (int64_t dim : a) {
-    if (dim < 0) return false;
-  }
-  for (int64_t dim : b) {
-    if (dim < 0) return false;
-  }
-  const int64_t k_a = trans_a ? a[0] : a[1];
-  const int64_t k_b = trans_b ? b[1] : b[0];
-  if (k_a != k_b) {
-    return false;
-  }
-  const int64_t m = trans_a ? a[1] : a[0];
-  const int64_t n = trans_b ? b[0] : b[1];
-  if (bias != nullptr && !BiasBroadcastable(*bias, m, n)) {
-    return false;
-  }
-  *out = {m, n};
-  return true;
-}
-
-OwnedBuffer Upload(Device& device, const float* data, const std::vector<int64_t>& shape) {
-  const int64_t count = ElementCount(shape);
-  if (count > 0 && data == nullptr) {
-    throw std::invalid_argument("missing host data");
-  }
-  OwnedBuffer owned;
-  owned.device = &device;
-  owned.shape = shape;
-  owned.buffer = device.Allocate(static_cast<size_t>(count) * sizeof(float));
-  if (count > 0) {
-    device.CopyHostToDevice(owned.buffer, data, static_cast<size_t>(count) * sizeof(float));
-  }
-  return owned;
-}
-
-void ExecuteFusedMatMul(Device& device, const Operand& a, const Operand& b, const FusedMatMulConfig& config,
-                        bool relu, float* out_host) {
+void ExecuteFusedImpl(Device& device, const Operand& a, const Operand& b, const FusedMatMulConfig& config,
+                      Activation activation, const Operand* residual, float* out_host, OwnedBuffer* retain,
+                      bool note_matmul) {
   std::vector<int64_t> out_shape;
   if (!InferFusedMatMulShape(a.shape, config.trans_a, b.shape, config.trans_b, &out_shape)) {
     throw std::invalid_argument("FusedMatMul shapes are not supported");
@@ -281,7 +271,7 @@ void ExecuteFusedMatMul(Device& device, const Operand& a, const Operand& b, cons
   const DeviceBuffer a_buf = Resolve(device, a, &a_upload);
   const DeviceBuffer b_buf = Resolve(device, b, &b_upload);
   const int64_t out_count = ElementCount(out_shape);
-  if (out_count > 0 && out_host == nullptr) {
+  if (retain == nullptr && out_count > 0 && out_host == nullptr) {
     throw std::invalid_argument("missing FusedMatMul output");
   }
   OwnedBuffer out;
@@ -323,25 +313,272 @@ void ExecuteFusedMatMul(Device& device, const Operand& a, const Operand& b, cons
       NextIndex(&index, out_batch);
     }
   }
-  // Scale and Relu stay on the product. The pre-activation is not copied back.
-  if (out_count > 0 && (config.alpha != 1.f || relu)) {
-    device.GemmEpilogue(out.buffer, out_count, 1, config.alpha, nullptr, {}, 0.f, relu);
+  if (out_count > 0 && (config.alpha != 1.f || activation != Activation::None)) {
+    device.GemmEpilogue(out.buffer, out_count, 1, config.alpha, nullptr, {}, 0.f, activation);
   }
-  if (out_count > 0) {
-    device.CopyDeviceToHost(out_host, out.buffer, static_cast<size_t>(out_count) * sizeof(float));
+  NoteActivation(activation);
+  if (residual != nullptr) {
+    OwnedBuffer residual_upload;
+    if (out_count > 0) {
+      const DeviceBuffer residual_buf = Resolve(device, *residual, &residual_upload);
+      device.GemmEpilogue(out.buffer, 1, out_count, 1.f, &residual_buf, std::vector<int64_t>{out_count}, 1.f,
+                          Activation::None);
+    }
+    NoteAddEpilogue();
   }
-  if (relu) {
-    NoteReluEpilogue();
+  Deliver(device, &out, out_count, out_host, retain);
+  if (note_matmul) {
+    NoteMatmulOp();
   }
-  NoteMatmulOp();
 }
 
-void ExecuteMatMul(Device& device, const Operand& a, const Operand& b, float* out_host, bool relu) {
-  ExecuteFusedMatMul(device, a, b, {}, relu, out_host);
+}  // namespace
+
+void ResetAcceleratorStats() {
+  Stats& stats = GlobalStats();
+  stats.matmul_ops.store(0);
+  stats.gemm_ops.store(0);
+  stats.kernel_matmuls.store(0);
+  stats.relu_epilogues.store(0);
+  stats.gelu_epilogues.store(0);
+  stats.add_epilogues.store(0);
+  stats.device_transposes.store(0);
+  stats.bytes_to_device.store(0);
+  stats.bytes_to_host.store(0);
+  std::lock_guard<std::mutex> lock(ProfileMu());
+  ProfileLog().clear();
 }
 
-void ExecuteGemm(Device& device, const Operand& a, const Operand& b, const Operand* bias,
-                 const GemmConfig& config, float* out_host, bool relu) {
+AcceleratorStats GetAcceleratorStats() {
+  const Stats& stats = GlobalStats();
+  AcceleratorStats out;
+  out.matmul_ops = stats.matmul_ops.load();
+  out.gemm_ops = stats.gemm_ops.load();
+  out.kernel_matmuls = stats.kernel_matmuls.load();
+  out.relu_epilogues = stats.relu_epilogues.load();
+  out.gelu_epilogues = stats.gelu_epilogues.load();
+  out.add_epilogues = stats.add_epilogues.load();
+  out.device_transposes = stats.device_transposes.load();
+  out.bytes_to_device = stats.bytes_to_device.load();
+  out.bytes_to_host = stats.bytes_to_host.load();
+  return out;
+}
+
+void NoteMatmulOp() { GlobalStats().matmul_ops.fetch_add(1); }
+void NoteGemmOp() { GlobalStats().gemm_ops.fetch_add(1); }
+void NoteKernelMatmul() { GlobalStats().kernel_matmuls.fetch_add(1); }
+void NoteReluEpilogue() { GlobalStats().relu_epilogues.fetch_add(1); }
+void NoteGeluEpilogue() { GlobalStats().gelu_epilogues.fetch_add(1); }
+void NoteAddEpilogue() { GlobalStats().add_epilogues.fetch_add(1); }
+void NoteDeviceTranspose() { GlobalStats().device_transposes.fetch_add(1); }
+void NoteBytesToDevice(size_t bytes) { GlobalStats().bytes_to_device.fetch_add(static_cast<int64_t>(bytes)); }
+void NoteBytesToHost(size_t bytes) { GlobalStats().bytes_to_host.fetch_add(static_cast<int64_t>(bytes)); }
+
+void AppendProfileRecord(ProfileRecord record) {
+  std::lock_guard<std::mutex> lock(ProfileMu());
+  ProfileLog().push_back(std::move(record));
+}
+
+int WriteProfile(const char* path) {
+  if (path == nullptr) {
+    return 1;
+  }
+  const std::string json = ProfileJson();
+  std::ofstream out(path, std::ios::binary | std::ios::trunc);
+  if (!out) {
+    return 1;
+  }
+  out << json;
+  if (!out) {
+    return 1;
+  }
+  return 0;
+}
+
+void ClearProfileForTest() {
+  std::lock_guard<std::mutex> lock(ProfileMu());
+  ProfileLog().clear();
+}
+
+void NoteConstantTouch(uint64_t id, const void* address, uint64_t bytes) {
+  ConstantTouch touch;
+  touch.id = id;
+  touch.address = reinterpret_cast<uint64_t>(address);
+  touch.bytes = bytes;
+  std::lock_guard<std::mutex> lock(TouchMu());
+  TouchLog().push_back(touch);
+}
+
+void ClearConstantTouches() {
+  std::lock_guard<std::mutex> lock(TouchMu());
+  TouchLog().clear();
+}
+
+int64_t ConstantTouchCount() {
+  std::lock_guard<std::mutex> lock(TouchMu());
+  return static_cast<int64_t>(TouchLog().size());
+}
+
+uint64_t ConstantTouchId(int64_t index) {
+  std::lock_guard<std::mutex> lock(TouchMu());
+  if (index < 0 || static_cast<size_t>(index) >= TouchLog().size()) {
+    return 0;
+  }
+  return TouchLog()[static_cast<size_t>(index)].id;
+}
+
+uint64_t ConstantTouchAddress(int64_t index) {
+  std::lock_guard<std::mutex> lock(TouchMu());
+  if (index < 0 || static_cast<size_t>(index) >= TouchLog().size()) {
+    return 0;
+  }
+  return TouchLog()[static_cast<size_t>(index)].address;
+}
+
+uint64_t ConstantTouchBytes(int64_t index) {
+  std::lock_guard<std::mutex> lock(TouchMu());
+  if (index < 0 || static_cast<size_t>(index) >= TouchLog().size()) {
+    return 0;
+  }
+  return TouchLog()[static_cast<size_t>(index)].bytes;
+}
+
+int64_t ElementCount(const std::vector<int64_t>& shape) {
+  int64_t count = 1;
+  for (int64_t dim : shape) {
+    if (dim < 0) {
+      throw std::invalid_argument("dynamic dimension");
+    }
+    if (dim != 0 && count > std::numeric_limits<int64_t>::max() / dim) {
+      throw std::overflow_error("tensor is too large");
+    }
+    count *= dim;
+  }
+  return count;
+}
+
+bool InferMatMulShape(const std::vector<int64_t>& a, const std::vector<int64_t>& b, std::vector<int64_t>* out) {
+  if (out == nullptr || a.size() < 2 || b.size() < 2) {
+    return false;
+  }
+  for (int64_t dim : a) {
+    if (dim < 0) {
+      return false;
+    }
+  }
+  for (int64_t dim : b) {
+    if (dim < 0) {
+      return false;
+    }
+  }
+  if (a.back() != b[b.size() - 2]) {
+    return false;
+  }
+  const std::vector<int64_t> a_batch(a.begin(), a.end() - 2);
+  const std::vector<int64_t> b_batch(b.begin(), b.end() - 2);
+  std::vector<int64_t> batch;
+  if (!BroadcastShapes(a_batch, b_batch, &batch)) {
+    return false;
+  }
+  batch.push_back(a[a.size() - 2]);
+  batch.push_back(b.back());
+  *out = std::move(batch);
+  return true;
+}
+
+bool InferFusedMatMulShape(const std::vector<int64_t>& a, bool trans_a, const std::vector<int64_t>& b, bool trans_b,
+                           std::vector<int64_t>* out) {
+  std::vector<int64_t> a_logical = a;
+  std::vector<int64_t> b_logical = b;
+  if (trans_a && !SwapLastTwo(&a_logical)) {
+    return false;
+  }
+  if (trans_b && !SwapLastTwo(&b_logical)) {
+    return false;
+  }
+  return InferMatMulShape(a_logical, b_logical, out);
+}
+
+bool InferGemmShape(const std::vector<int64_t>& a, bool trans_a, const std::vector<int64_t>& b, bool trans_b,
+                    const std::vector<int64_t>* bias, std::vector<int64_t>* out) {
+  if (out == nullptr || a.size() != 2 || b.size() != 2) {
+    return false;
+  }
+  for (int64_t dim : a) {
+    if (dim < 0) {
+      return false;
+    }
+  }
+  for (int64_t dim : b) {
+    if (dim < 0) {
+      return false;
+    }
+  }
+  const int64_t k_a = trans_a ? a[0] : a[1];
+  const int64_t k_b = trans_b ? b[1] : b[0];
+  if (k_a != k_b) {
+    return false;
+  }
+  const int64_t m = trans_a ? a[1] : a[0];
+  const int64_t n = trans_b ? b[0] : b[1];
+  if (bias != nullptr && !BiasBroadcastable(*bias, m, n)) {
+    return false;
+  }
+  *out = {m, n};
+  return true;
+}
+
+OwnedBuffer Upload(Device& device, const float* data, const std::vector<int64_t>& shape) {
+  const int64_t count = ElementCount(shape);
+  if (count > 0 && data == nullptr) {
+    throw std::invalid_argument("missing host data");
+  }
+  OwnedBuffer owned;
+  owned.device = &device;
+  owned.shape = shape;
+  owned.buffer = device.Allocate(static_cast<size_t>(count) * sizeof(float));
+  if (count > 0) {
+    device.CopyHostToDevice(owned.buffer, data, static_cast<size_t>(count) * sizeof(float));
+  }
+  return owned;
+}
+
+void PretransposeLastTwo(Device& device, const OwnedBuffer& src, OwnedBuffer* dst) {
+  if (dst == nullptr || src.shape.size() < 2 || src.buffer.data == nullptr) {
+    throw std::invalid_argument("pretranspose needs a matrix");
+  }
+  std::vector<int64_t> shape = src.shape;
+  const int64_t rows = shape[shape.size() - 2];
+  const int64_t cols = shape.back();
+  std::swap(shape[shape.size() - 2], shape.back());
+  const std::vector<int64_t> batch(src.shape.begin(), src.shape.end() - 2);
+  const int64_t batches = ElementCount(batch);
+  dst->Reset();
+  dst->device = &device;
+  dst->shape = std::move(shape);
+  dst->buffer = device.Allocate(static_cast<size_t>(ElementCount(dst->shape)) * sizeof(float));
+  const int64_t tile = rows * cols;
+  for (int64_t b = 0; b < batches; ++b) {
+    auto* src_ptr = static_cast<float*>(src.buffer.data) + b * tile;
+    auto* dst_ptr = static_cast<float*>(dst->buffer.data) + b * tile;
+    const DeviceBuffer src_tile{src_ptr, static_cast<size_t>(tile) * sizeof(float), 0};
+    const DeviceBuffer dst_tile{dst_ptr, static_cast<size_t>(tile) * sizeof(float), 0};
+    device.Transpose(src_tile, dst_tile, rows, cols);
+  }
+}
+
+void ExecuteFusedMatMul(Device& device, const Operand& a, const Operand& b, const FusedMatMulConfig& config,
+                        Activation activation, float* out_host, OwnedBuffer* retain) {
+  ExecuteFusedImpl(device, a, b, config, activation, nullptr, out_host, retain, true);
+}
+
+void ExecuteMatMul(Device& device, const Operand& a, const Operand& b, float* out_host, Activation activation,
+                   const Operand* residual, OwnedBuffer* retain) {
+  ExecuteFusedImpl(device, a, b, {}, activation, residual, out_host, retain, true);
+}
+
+void ExecuteGemm(Device& device, const Operand& a, const Operand& b, const Operand* bias, const GemmConfig& config,
+                 float* out_host, Activation activation, OwnedBuffer* retain) {
   std::vector<int64_t> out_shape;
   const std::vector<int64_t>* bias_shape = bias == nullptr ? nullptr : &bias->shape;
   if (!InferGemmShape(a.shape, config.trans_a, b.shape, config.trans_b, bias_shape, &out_shape)) {
@@ -377,7 +614,7 @@ void ExecuteGemm(Device& device, const Operand& a, const Operand& b, const Opera
   }
 
   const int64_t out_count = m * n;
-  if (out_count > 0 && out_host == nullptr) {
+  if (retain == nullptr && out_count > 0 && out_host == nullptr) {
     throw std::invalid_argument("missing Gemm output");
   }
   OwnedBuffer out;
@@ -387,7 +624,7 @@ void ExecuteGemm(Device& device, const Operand& a, const Operand& b, const Opera
   device.MatMul(a_mat, b_mat, out.buffer, m, k, n);
 
   const bool scale = config.alpha != 1.f;
-  if (bias != nullptr || scale || relu) {
+  if (bias != nullptr || scale || activation != Activation::None) {
     DeviceBuffer bias_buf{};
     const DeviceBuffer* bias_ptr = nullptr;
     if (bias != nullptr) {
@@ -395,15 +632,109 @@ void ExecuteGemm(Device& device, const Operand& a, const Operand& b, const Opera
       bias_ptr = &bias_buf;
     }
     device.GemmEpilogue(out.buffer, m, n, config.alpha, bias_ptr, bias == nullptr ? std::vector<int64_t>{} : bias->shape,
-                        config.beta, relu);
+                        config.beta, activation);
   }
-  if (out_count > 0) {
-    device.CopyDeviceToHost(out_host, out.buffer, static_cast<size_t>(out_count) * sizeof(float));
-  }
-  if (relu) {
-    NoteReluEpilogue();
-  }
+  NoteActivation(activation);
+  Deliver(device, &out, out_count, out_host, retain);
   NoteGemmOp();
+}
+
+KvTableStore::KvTableStore(Device& device) : device_(&device) {}
+
+KvTableStore::Slot* KvTableStore::Find(const std::string& name) {
+  for (auto& entry : slots_) {
+    if (entry.first == name) {
+      return &entry.second;
+    }
+  }
+  return nullptr;
+}
+
+const KvTableStore::Slot* KvTableStore::Find(const std::string& name) const {
+  for (const auto& entry : slots_) {
+    if (entry.first == name) {
+      return &entry.second;
+    }
+  }
+  return nullptr;
+}
+
+void KvTableStore::Create(const std::string& name, int64_t rows, int64_t cols) {
+  if (name.empty() || rows < 0 || cols < 0 || Find(name) != nullptr) {
+    throw std::invalid_argument("KvTable Create rejected");
+  }
+  Slot slot;
+  slot.rows = rows;
+  slot.cols = cols;
+  slot.filled = 0;
+  slot.buffer.device = device_;
+  slot.buffer.shape = {rows, cols};
+  slot.buffer.buffer = device_->Allocate(static_cast<size_t>(rows * cols) * sizeof(float));
+  slots_.emplace_back(name, std::move(slot));
+}
+
+void KvTableStore::Append(const std::string& name, const float* data, int64_t n_rows) {
+  Slot* slot = Find(name);
+  if (slot == nullptr || n_rows < 0 || slot->filled > slot->rows - n_rows) {
+    throw std::invalid_argument("KvTable Append rejected");
+  }
+  if (n_rows > 0 && data == nullptr) {
+    throw std::invalid_argument("KvTable Append rejected");
+  }
+  if (n_rows > 0) {
+    auto* base = static_cast<float*>(slot->buffer.buffer.data);
+    const int64_t elems = n_rows * slot->cols;
+    const DeviceBuffer tile{base + slot->filled * slot->cols, static_cast<size_t>(elems) * sizeof(float), 0};
+    device_->CopyHostToDevice(tile, data, tile.bytes);
+  }
+  slot->filled += n_rows;
+}
+
+void KvTableStore::Update(const std::string& name, int64_t row, const float* data, int64_t n_rows) {
+  Slot* slot = Find(name);
+  if (slot == nullptr || row < 0 || n_rows < 0 || row > slot->filled || n_rows > slot->filled - row) {
+    throw std::invalid_argument("KvTable Update rejected");
+  }
+  if (n_rows > 0 && data == nullptr) {
+    throw std::invalid_argument("KvTable Update rejected");
+  }
+  if (n_rows > 0) {
+    auto* base = static_cast<float*>(slot->buffer.buffer.data);
+    const int64_t elems = n_rows * slot->cols;
+    const DeviceBuffer tile{base + row * slot->cols, static_cast<size_t>(elems) * sizeof(float), 0};
+    device_->CopyHostToDevice(tile, data, tile.bytes);
+  }
+}
+
+bool KvTableStore::Contains(const std::string& name) const { return Find(name) != nullptr; }
+
+void KvTableStore::Read(const std::string& name, float* dst, int64_t n_rows) const {
+  const Slot* slot = Find(name);
+  if (slot == nullptr || dst == nullptr || n_rows < 0 || n_rows > slot->filled) {
+    throw std::invalid_argument("KvTable Read rejected");
+  }
+  if (n_rows == 0) {
+    return;
+  }
+  const DeviceBuffer src{slot->buffer.buffer.data, static_cast<size_t>(n_rows * slot->cols) * sizeof(float),
+                         slot->buffer.buffer.id};
+  device_->CopyDeviceToHost(dst, src, src.bytes);
+}
+
+const void* KvTableStore::Storage(const std::string& name) const {
+  const Slot* slot = Find(name);
+  if (slot == nullptr) {
+    throw std::invalid_argument("KvTable Storage rejected");
+  }
+  return slot->buffer.buffer.data;
+}
+
+int64_t KvTableStore::Filled(const std::string& name) const {
+  const Slot* slot = Find(name);
+  if (slot == nullptr) {
+    throw std::invalid_argument("KvTable Filled rejected");
+  }
+  return slot->filled;
 }
 
 }  // namespace accel
