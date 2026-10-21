@@ -1,4 +1,4 @@
-"""AccelEP runs MatMul and Gemm. Every other op stays on CPU."""
+"""AccelEP runs MatMul and Gemm. A single-consumer RMSNormalization can stay on the device."""
 
 import ctypes
 import gc
@@ -182,6 +182,17 @@ def prepare_chain():
         "want": np.maximum(chain_x.T @ chain_w1, 0) @ chain_w2,
         "extended": graphs["extended"],
     }
+
+
+def device_rms(value, scale, eps=1e-5):
+    """Double sum, then float(x * inv) * weight. This is Device::RmsNorm, not ORT's layer norm."""
+    value = np.asarray(value, dtype=np.float32)
+    scale = np.asarray(scale, dtype=np.float32)
+    x = value.astype(np.float64)
+    dim = x.shape[-1]
+    square = np.sum(x * x, axis=-1, keepdims=True)
+    inv = 1.0 / np.sqrt(square / dim + np.float64(eps))
+    return (x * inv).astype(np.float32) * scale
 
 
 def layer_norm(value, scale):
@@ -862,13 +873,13 @@ def test_prenorm(lib, session):
     w2 = rng.standard_normal((8, 8)).astype(np.float32)
     proto = model(
         [
-            helper.make_node("LayerNormalization", ["X", "Scale"], ["N"], epsilon=1e-5),
+            helper.make_node("RMSNormalization", ["X", "Scale"], ["N"], epsilon=1e-5),
             helper.make_node("Transpose", ["N"], ["KT"], perm=[0, 2, 1]),
             helper.make_node("MatMul", ["N", "KT"], ["S"]),
             helper.make_node("Softmax", ["S"], ["P"], axis=-1),
             helper.make_node("MatMul", ["P", "N"], ["C"]),
             helper.make_node("Add", ["X", "C"], ["R"]),
-            helper.make_node("LayerNormalization", ["R", "Scale"], ["N2"], epsilon=1e-5),
+            helper.make_node("RMSNormalization", ["R", "Scale"], ["N2"], epsilon=1e-5),
             helper.make_node("MatMul", ["N2", "W1"], ["H"]),
             helper.make_node("Relu", ["H"], ["A"]),
             helper.make_node("MatMul", ["A", "W2"], ["Y0"]),
@@ -881,17 +892,20 @@ def test_prenorm(lib, session):
             numpy_helper.from_array(w1, "W1"),
             numpy_helper.from_array(w2, "W2"),
         ],
+        opset=23,
     )
-    n = layer_norm(x, scale)
+    n = device_rms(x, scale)
     scores = n @ n.transpose(0, 2, 1)
     context = stable_softmax(scores) @ n
     residual = x + context
-    n2 = layer_norm(residual, scale)
+    n2 = device_rms(residual, scale)
     want = residual + np.maximum(n2 @ w1, 0) @ w2
     cpu = cpu_session(proto).run(None, {"X": x})[0]
     _, got = run_once(lib, session, proto, {"X": x})
     check("prenorm numpy", got, want)
     check("prenorm cpu", got, cpu)
+    # The closing residual is on the device, so the add count is 2.
+    # The attention norm still has two consumers and stays on the CPU.
     require(
         lib,
         "prenorm",
@@ -900,10 +914,10 @@ def test_prenorm(lib, session):
         kernels=4,
         relu=1,
         gelu=0,
-        add=1,
+        add=2,
         transposes=0,
-        to_device=704,
-        to_host=320,
+        to_device=576,
+        to_host=192,
     )
 
 

@@ -75,11 +75,12 @@ ACCEL_SIM_API int accel_llama_weight(AccelLlama* model, int32_t kind, int32_t la
                                     int64_t rows, int64_t cols);
 /* Load a Hugging Face tokenizer.json. Encode and decode then run inside the simulator. */
 ACCEL_SIM_API int accel_llama_tokenizer(AccelLlama* model, const char* path);
-/* temperature <= 0 is greedy argmax. Logits never leave the device.
+/* temperature <= 0 is greedy argmax. top_k <= 0 or top_k >= vocab draws from the whole vocabulary.
+   A smaller positive top_k keeps at most 64 logits. Logits never leave the device.
    Copies back the chosen int32 token ids. *out_count is the number written. */
 ACCEL_SIM_API int accel_llama_generate(AccelLlama* model, const int32_t* prompt, int32_t prompt_count,
                                        int32_t max_new, int32_t eos_id, float temperature, uint32_t seed,
-                                       int32_t* out_ids, int32_t* out_count);
+                                       int32_t top_k, int32_t* out_ids, int32_t* out_count);
 /* Encode `text_len` bytes on the simulator. The buffer may contain NUL.
    *out_count is the number of ids written. */
 ACCEL_SIM_API int accel_llama_encode(AccelLlama* model, const char* text, int32_t text_len, int32_t* out_ids,
@@ -90,11 +91,27 @@ ACCEL_SIM_API int accel_llama_decode(AccelLlama* model, const int32_t* ids, int3
                                      char* out_text, int32_t out_cap, int32_t* out_len);
 /* Encode the prompt, sample, and decode on the simulator. `prompt_len` is the
    byte count and may include NUL. Copies back the completion text and the
-   chosen token ids. Logits stay on the device. */
+   chosen token ids. Logits stay on the device. top_k <= 0 or top_k >= vocab keeps the full vocabulary. */
 ACCEL_SIM_API int accel_llama_complete(AccelLlama* model, const char* prompt, int32_t prompt_len, int32_t max_new,
-                                       int32_t eos_id, float temperature, uint32_t seed, char* out_text,
+                                       int32_t eos_id, float temperature, uint32_t seed, int32_t top_k, char* out_text,
                                        int32_t out_text_cap, int32_t* out_text_len, int32_t* out_ids,
                                        int32_t out_ids_cap, int32_t* out_count, int32_t* prompt_tokens);
+/* Called with each chosen id after that id has been read. Must not call back into the model.
+   The host uses it to detokenize a stable UTF-8 prefix. It is not a device copy. */
+typedef void (*AccelLlamaTokenFn)(int32_t token_id, void* user);
+/* Same result as accel_llama_complete. on_token may be null. Counted copies stay the final
+   id list and the final UTF-8 text. */
+ACCEL_SIM_API int accel_llama_complete_stream(AccelLlama* model, const char* prompt, int32_t prompt_len,
+                                              int32_t max_new, int32_t eos_id, float temperature, uint32_t seed,
+                                              int32_t top_k, char* out_text, int32_t out_text_cap, int32_t* out_text_len,
+                                              int32_t* out_ids, int32_t out_ids_cap, int32_t* out_count,
+                                              int32_t* prompt_tokens, AccelLlamaTokenFn on_token, void* user);
+/* Test-only. reset nonzero clears the cache. Runs Forward and leaves logits on the device. */
+ACCEL_SIM_API int accel_llama_forward_ids(AccelLlama* model, const int32_t* ids, int32_t count, int32_t reset);
+/* Test-only. Walks the device logit row against reference and writes one float.
+   Does not copy the logit row to the host. */
+ACCEL_SIM_API int accel_llama_logit_max_abs(AccelLlama* model, const float* reference, int32_t count,
+                                            float* out_max_abs);
 ACCEL_SIM_API void accel_llama_reset(AccelLlama* model);
 ACCEL_SIM_API const char* accel_llama_last_error(void);
 

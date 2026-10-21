@@ -75,7 +75,7 @@ class RecordingDevice final : public Device {
   void SiluMul(DeviceBuffer gate, DeviceBuffer up, int64_t count) override;
   void ResidualAdd(DeviceBuffer dest, DeviceBuffer extra, int64_t count) override;
   void SampleToken(DeviceBuffer logits, DeviceBuffer chosen_ids, int64_t chosen_index, int64_t vocab, float temperature,
-                   uint32_t* rng_state) override;
+                   uint32_t* rng_state, int top_k) override;
 
   const std::vector<TraceOp>& Trace() const { return trace_; }
   bool Replay(Device& target) const;

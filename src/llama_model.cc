@@ -99,7 +99,8 @@ struct LlamaModel {
   }
 
   void Generate(const int32_t* prompt, int32_t prompt_count, int32_t max_new, int32_t eos_id, float temperature,
-                uint32_t seed, int32_t* out_ids, int32_t* out_count) {
+                uint32_t seed, int32_t top_k, int32_t* out_ids, int32_t* out_count, AccelLlamaTokenFn on_token,
+                void* user) {
     filled = 0;
     if (prompt == nullptr || prompt_count <= 0 || prompt_count > config.context) {
       throw std::invalid_argument("forward exceeds context");
@@ -113,9 +114,12 @@ struct LlamaModel {
       if (produced >= config.context) {
         throw std::invalid_argument("generation exceeded the token buffer");
       }
-      device->SampleToken(logits.buffer, chosen.buffer, produced, config.vocab, temperature, &rng);
+      device->SampleToken(logits.buffer, chosen.buffer, produced, config.vocab, temperature, &rng, top_k);
       const int32_t id = static_cast<const int32_t*>(chosen.buffer.data)[produced];
       produced += 1;
+      if (on_token != nullptr) {
+        on_token(id, user);
+      }
       if (id == eos_id || filled >= config.context) {
         break;
       }
@@ -143,9 +147,43 @@ struct LlamaModel {
     device->CopyDeviceToHost(out_text, text_out.buffer, text.size());
   }
 
+  void ForwardIds(const int32_t* ids, int32_t count, bool reset) {
+    if (!Ready()) {
+      throw std::invalid_argument("llama weights are incomplete");
+    }
+    if (ids == nullptr || count <= 0) {
+      throw std::invalid_argument("invalid forward");
+    }
+    if (reset) {
+      filled = 0;
+    }
+    if (filled < 0 || count > config.context - filled) {
+      throw std::invalid_argument("forward exceeds context");
+    }
+    device->CopyHostToDevice(prompt_ids.buffer, ids, static_cast<size_t>(count) * sizeof(int32_t));
+    Forward(prompt_ids.buffer, count, 0);
+    filled += count;
+  }
+
+  float LogitMaxAbs(const float* reference, int32_t count) const {
+    if (reference == nullptr || logits.buffer.data == nullptr || count != config.vocab) {
+      throw std::invalid_argument("invalid logit reference");
+    }
+    const float* row = static_cast<const float*>(logits.buffer.data);
+    float max_abs = 0.f;
+    for (int32_t i = 0; i < count; ++i) {
+      const float delta = std::fabs(row[i] - reference[i]);
+      if (delta > max_abs) {
+        max_abs = delta;
+      }
+    }
+    return max_abs;
+  }
+
   void Complete(const char* prompt, int32_t prompt_len, int32_t max_new, int32_t eos_id, float temperature,
-                uint32_t seed, char* out_text, int32_t out_text_cap, int32_t* out_text_len, int32_t* out_ids,
-                int32_t out_ids_cap, int32_t* out_count, int32_t* prompt_tokens) {
+                uint32_t seed, int32_t top_k, char* out_text, int32_t out_text_cap, int32_t* out_text_len,
+                int32_t* out_ids, int32_t out_ids_cap, int32_t* out_count, int32_t* prompt_tokens,
+                AccelLlamaTokenFn on_token, void* user) {
     if (!bpe.loaded()) {
       throw std::invalid_argument("tokenizer is not loaded");
     }
@@ -161,7 +199,8 @@ struct LlamaModel {
     if (static_cast<int32_t>(ids.size()) > config.context) {
       throw std::invalid_argument("prompt exceeds context");
     }
-    Generate(ids.data(), static_cast<int32_t>(ids.size()), max_new, eos_id, temperature, seed, out_ids, out_count);
+    Generate(ids.data(), static_cast<int32_t>(ids.size()), max_new, eos_id, temperature, seed, top_k, out_ids,
+             out_count, on_token, user);
     const std::string text = bpe.Decode(static_cast<const int32_t*>(chosen.buffer.data), *out_count, true);
     CopyOutText(text, out_text, out_text_cap, out_text_len);
     *prompt_tokens = static_cast<int32_t>(ids.size());
@@ -383,7 +422,8 @@ int accel_llama_weight(AccelLlama* handle, int32_t kind, int32_t layer, const fl
 }
 
 int accel_llama_generate(AccelLlama* handle, const int32_t* prompt, int32_t prompt_count, int32_t max_new,
-                         int32_t eos_id, float temperature, uint32_t seed, int32_t* out_ids, int32_t* out_count) {
+                         int32_t eos_id, float temperature, uint32_t seed, int32_t top_k, int32_t* out_ids,
+                         int32_t* out_count) {
   LlamaModel* model = reinterpret_cast<LlamaModel*>(handle);
   if (model == nullptr || prompt == nullptr || out_ids == nullptr || out_count == nullptr || prompt_count <= 0 ||
       max_new < 0) {
@@ -396,7 +436,8 @@ int accel_llama_generate(AccelLlama* handle, const int32_t* prompt, int32_t prom
       Fail("llama weights are incomplete");
       return 1;
     }
-    model->Generate(prompt, prompt_count, max_new, eos_id, temperature, seed, out_ids, out_count);
+    model->Generate(prompt, prompt_count, max_new, eos_id, temperature, seed, top_k, out_ids, out_count, nullptr,
+                    nullptr);
     Clear();
     return 0;
   } catch (const std::exception& ex) {
@@ -478,8 +519,18 @@ int accel_llama_decode(AccelLlama* handle, const int32_t* ids, int32_t count, in
 }
 
 int accel_llama_complete(AccelLlama* handle, const char* prompt, int32_t prompt_len, int32_t max_new, int32_t eos_id,
-                         float temperature, uint32_t seed, char* out_text, int32_t out_text_cap, int32_t* out_text_len,
-                         int32_t* out_ids, int32_t out_ids_cap, int32_t* out_count, int32_t* prompt_tokens) {
+                         float temperature, uint32_t seed, int32_t top_k, char* out_text, int32_t out_text_cap,
+                         int32_t* out_text_len, int32_t* out_ids, int32_t out_ids_cap, int32_t* out_count,
+                         int32_t* prompt_tokens) {
+  return accel_llama_complete_stream(handle, prompt, prompt_len, max_new, eos_id, temperature, seed, top_k, out_text,
+                                     out_text_cap, out_text_len, out_ids, out_ids_cap, out_count, prompt_tokens,
+                                     nullptr, nullptr);
+}
+
+int accel_llama_complete_stream(AccelLlama* handle, const char* prompt, int32_t prompt_len, int32_t max_new,
+                                int32_t eos_id, float temperature, uint32_t seed, int32_t top_k, char* out_text,
+                                int32_t out_text_cap, int32_t* out_text_len, int32_t* out_ids, int32_t out_ids_cap,
+                                int32_t* out_count, int32_t* prompt_tokens, AccelLlamaTokenFn on_token, void* user) {
   LlamaModel* model = reinterpret_cast<LlamaModel*>(handle);
   if (model == nullptr || prompt_len < 0 || (prompt_len > 0 && prompt == nullptr) || max_new < 0) {
     Fail("invalid complete");
@@ -491,8 +542,42 @@ int accel_llama_complete(AccelLlama* handle, const char* prompt, int32_t prompt_
       Fail("llama weights are incomplete");
       return 1;
     }
-    model->Complete(prompt, prompt_len, max_new, eos_id, temperature, seed, out_text, out_text_cap, out_text_len,
-                    out_ids, out_ids_cap, out_count, prompt_tokens);
+    model->Complete(prompt, prompt_len, max_new, eos_id, temperature, seed, top_k, out_text, out_text_cap, out_text_len,
+                    out_ids, out_ids_cap, out_count, prompt_tokens, on_token, user);
+    Clear();
+    return 0;
+  } catch (const std::exception& ex) {
+    Fail(ex.what());
+    return 1;
+  }
+}
+
+int accel_llama_forward_ids(AccelLlama* handle, const int32_t* ids, int32_t count, int32_t reset) {
+  LlamaModel* model = reinterpret_cast<LlamaModel*>(handle);
+  if (model == nullptr) {
+    Fail("invalid forward");
+    return 1;
+  }
+  try {
+    std::lock_guard<std::mutex> lock(model->mu);
+    model->ForwardIds(ids, count, reset != 0);
+    Clear();
+    return 0;
+  } catch (const std::exception& ex) {
+    Fail(ex.what());
+    return 1;
+  }
+}
+
+int accel_llama_logit_max_abs(AccelLlama* handle, const float* reference, int32_t count, float* out_max_abs) {
+  LlamaModel* model = reinterpret_cast<LlamaModel*>(handle);
+  if (model == nullptr || out_max_abs == nullptr) {
+    Fail("invalid logit reference");
+    return 1;
+  }
+  try {
+    std::lock_guard<std::mutex> lock(model->mu);
+    *out_max_abs = model->LogitMaxAbs(reference, count);
     Clear();
     return 0;
   } catch (const std::exception& ex) {

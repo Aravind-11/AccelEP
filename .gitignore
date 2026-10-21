@@ -4,3 +4,4 @@ __pycache__/
 .venv/
 onnxruntime_profile_*.json
 models/
+.vercel

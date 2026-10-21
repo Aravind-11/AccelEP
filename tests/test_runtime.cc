@@ -270,6 +270,140 @@ void TestPackedGemmProbes() {
   CHECK(accel::GetAcceleratorStats().kernel_matmuls == 1);
 }
 
+void TestTiledDeviceMatchesReference() {
+  auto check_shape = [](int64_t m, int64_t k, int64_t n, uint32_t seed) {
+    std::vector<float> a;
+    std::vector<float> b;
+    FillLcg(&a, m * k, &seed);
+    FillLcg(&b, k * n, &seed);
+    auto sim = accel::CreateSimDevice();
+    auto tiled = accel::CreateTiledDevice();
+    CHECK(std::strcmp(sim->Name(), tiled->Name()) != 0);
+    std::vector<float> sim_out(static_cast<size_t>(m * n), 1.f);
+    std::vector<float> tiled_out(static_cast<size_t>(m * n), 1.f);
+    std::vector<float> ref(static_cast<size_t>(m * n), 1.f);
+    accel::ExecuteMatMul(*sim, {a.data(), nullptr, {m, k}}, {b.data(), nullptr, {k, n}}, sim_out.data());
+    accel::OwnedBuffer a_buf = accel::Upload(*tiled, a.data(), {m, k});
+    accel::OwnedBuffer b_buf = accel::Upload(*tiled, b.data(), {k, n});
+    accel::OwnedBuffer c_buf;
+    c_buf.device = tiled.get();
+    c_buf.shape = {m, n};
+    c_buf.buffer = tiled->Allocate(static_cast<size_t>(m * n) * sizeof(float));
+    tiled->MatMul(a_buf.buffer, b_buf.buffer, c_buf.buffer, m, k, n);
+    tiled->CopyDeviceToHost(tiled_out.data(), c_buf.buffer, tiled_out.size() * sizeof(float));
+    accel::ReferenceMatMul(a.data(), b.data(), ref.data(), m, k, n);
+    CHECK(std::memcmp(sim_out.data(), ref.data(), ref.size() * sizeof(float)) == 0);
+    CHECK(std::memcmp(tiled_out.data(), ref.data(), ref.size() * sizeof(float)) == 0);
+  };
+  check_shape(128, 160, 96, 1);
+  check_shape(13, 19, 17, 2);
+
+  auto tiled = accel::CreateTiledDevice();
+  const float dummy = 0.f;
+  accel::OwnedBuffer a_buf = accel::Upload(*tiled, &dummy, {1, 0});
+  accel::OwnedBuffer b_buf = accel::Upload(*tiled, &dummy, {0, 1});
+  accel::OwnedBuffer c_buf;
+  c_buf.device = tiled.get();
+  c_buf.buffer = tiled->Allocate(sizeof(float));
+  float out = 3.f;
+  std::memcpy(c_buf.buffer.data, &out, sizeof(out));
+  tiled->MatMul(a_buf.buffer, b_buf.buffer, c_buf.buffer, 1, 0, 1);
+  tiled->CopyDeviceToHost(&out, c_buf.buffer, sizeof(out));
+  CHECK(out == 0.f);
+}
+
+accel::OwnedBuffer UploadRaw(accel::Device& device, const void* data, size_t bytes) {
+  accel::OwnedBuffer owned;
+  owned.device = &device;
+  owned.buffer = device.Allocate(bytes);
+  if (bytes > 0 && data != nullptr) {
+    device.CopyHostToDevice(owned.buffer, data, bytes);
+  }
+  return owned;
+}
+
+void TestQuantizedPanelMatchesReference() {
+  constexpr int64_t m = 8;
+  constexpr int64_t k = 160;
+  constexpr int64_t n = 300;
+  uint32_t seed = 3;
+  std::vector<float> a;
+  FillLcg(&a, m * k, &seed);
+  std::vector<int8_t> q(static_cast<size_t>(k * n));
+  std::vector<float> scale(static_cast<size_t>(k));
+  std::vector<int8_t> zero(static_cast<size_t>(k));
+  for (size_t i = 0; i < q.size(); ++i) {
+    seed = seed * 1664525u + 1013904223u;
+    q[i] = static_cast<int8_t>(static_cast<int>(seed % 251u) - 125);
+  }
+  for (int64_t row = 0; row < k; ++row) {
+    scale[static_cast<size_t>(row)] = static_cast<float>(row % 5) * 0.25f + 0.5f;
+    zero[static_cast<size_t>(row)] = static_cast<int8_t>(row % 7 - 3);
+  }
+  std::vector<float> b_ref(static_cast<size_t>(k * n));
+  for (int64_t index = 0; index < k * n; ++index) {
+    const int64_t row = index / n;
+    const float weight = static_cast<float>(q[static_cast<size_t>(index)]) - static_cast<float>(zero[static_cast<size_t>(row)]);
+    b_ref[static_cast<size_t>(index)] = weight * scale[static_cast<size_t>(row)];
+  }
+  auto device = accel::CreateSimDevice();
+  accel::OwnedBuffer q_buf = UploadRaw(*device, q.data(), q.size());
+  accel::OwnedBuffer scale_buf = UploadRaw(*device, scale.data(), scale.size() * sizeof(float));
+  accel::OwnedBuffer zero_buf = UploadRaw(*device, zero.data(), zero.size());
+  accel::Operand b_op;
+  b_op.quant = true;
+  b_op.shape = {k, n};
+  b_op.quant_plane.q = static_cast<const int8_t*>(q_buf.buffer.data);
+  b_op.quant_plane.scale = static_cast<const float*>(scale_buf.buffer.data);
+  b_op.quant_plane.zero = static_cast<const int8_t*>(zero_buf.buffer.data);
+  b_op.quant_plane.shape = {k, n};
+  b_op.quant_plane.axis = 0;
+  accel::ResetPackedGemmProbes();
+  accel::ResetAcceleratorStats();
+  std::vector<float> out(static_cast<size_t>(m * n), 1.f);
+  std::vector<float> ref(static_cast<size_t>(m * n), 1.f);
+  accel::ExecuteMatMul(*device, {a.data(), nullptr, {m, k}}, b_op, out.data());
+  accel::ReferenceMatMul(a.data(), b_ref.data(), ref.data(), m, k, n);
+  CHECK(std::memcmp(out.data(), ref.data(), out.size() * sizeof(float)) == 0);
+  CHECK(accel::PackedMatMulCalls() == 1);
+  CHECK(accel::PackedKTrips() == k);
+  const accel::AcceleratorStats stats = accel::GetAcceleratorStats();
+  CHECK(stats.kernel_matmuls == 1);
+  CHECK(stats.matmul_ops == 1);
+  CHECK(stats.bytes_to_device == static_cast<int64_t>(a.size() * sizeof(float)));
+  CHECK(stats.bytes_to_host == static_cast<int64_t>(out.size() * sizeof(float)));
+
+  std::vector<float> scalar_ref(static_cast<size_t>(k * n));
+  for (int64_t index = 0; index < k * n; ++index) {
+    scalar_ref[static_cast<size_t>(index)] = static_cast<float>(q[static_cast<size_t>(index)]) * 0.5f;
+  }
+  const float scalar = 0.5f;
+  accel::OwnedBuffer scalar_buf = UploadRaw(*device, &scalar, sizeof(scalar));
+  b_op.quant_plane.scale = static_cast<const float*>(scalar_buf.buffer.data);
+  b_op.quant_plane.zero = nullptr;
+  b_op.quant_plane.axis = -1;
+  accel::ResetPackedGemmProbes();
+  accel::ResetAcceleratorStats();
+  std::fill(out.begin(), out.end(), 1.f);
+  accel::ExecuteMatMul(*device, {a.data(), nullptr, {m, k}}, b_op, out.data());
+  accel::ReferenceMatMul(a.data(), scalar_ref.data(), ref.data(), m, k, n);
+  CHECK(std::memcmp(out.data(), ref.data(), out.size() * sizeof(float)) == 0);
+  CHECK(accel::PackedMatMulCalls() == 1);
+  CHECK(accel::PackedKTrips() == k);
+
+  accel::FusedMatMulConfig config;
+  config.trans_b = true;
+  accel::Operand flipped = b_op;
+  flipped.shape = {n, k};
+  bool threw = false;
+  try {
+    accel::ExecuteFusedMatMul(*device, {a.data(), nullptr, {m, k}}, flipped, config, accel::Activation::None, out.data());
+  } catch (const std::invalid_argument& ex) {
+    threw = std::strstr(ex.what(), "transpose") != nullptr;
+  }
+  CHECK(threw);
+}
+
 void TestInferRejectsNegative() {
   std::vector<int64_t> out;
   CHECK(!accel::InferMatMulShape({-1, 8}, {8, 4}, &out));
@@ -587,6 +721,8 @@ int main() {
   TestGemmReluEpilogue();
   TestRejectsFusedShape();
   TestPackedGemmProbes();
+  TestTiledDeviceMatchesReference();
+  TestQuantizedPanelMatchesReference();
   TestInferRejectsNegative();
   TestSplitProductBits();
   TestNonFiniteEpilogueBits();

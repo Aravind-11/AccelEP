@@ -261,15 +261,16 @@ void RecordingDevice::ResidualAdd(DeviceBuffer dest, DeviceBuffer extra, int64_t
 }
 
 void RecordingDevice::SampleToken(DeviceBuffer logits, DeviceBuffer chosen_ids, int64_t chosen_index, int64_t vocab,
-                                  float temperature, uint32_t* rng_state) {
+                                  float temperature, uint32_t* rng_state, int top_k) {
   const uint32_t rng_before = rng_state == nullptr ? 0u : *rng_state;
-  inner_.SampleToken(logits, chosen_ids, chosen_index, vocab, temperature, rng_state);
+  inner_.SampleToken(logits, chosen_ids, chosen_index, vocab, temperature, rng_state, top_k);
   TraceOp op;
   op.op = "SampleToken";
   op.a = Cover(logits);
   op.dst = Cover(chosen_ids);
   op.m = chosen_index;
   op.n = vocab;
+  op.k = top_k;
   op.alpha = temperature;
   op.hash = rng_before;
   op.dst_hash = Peek(chosen_ids);
@@ -493,7 +494,7 @@ bool RecordingDevice::Replay(Device& target) const {
           return false;
         }
         uint32_t rng = static_cast<uint32_t>(op.hash);
-        target.SampleToken(logits, chosen, op.m, op.n, op.alpha, &rng);
+        target.SampleToken(logits, chosen, op.m, op.n, op.alpha, &rng, static_cast<int>(op.k));
         if (!same(chosen, op.dst_hash)) {
           return false;
         }

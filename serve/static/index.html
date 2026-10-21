@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AccelEP</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f4efe6;
+      --card: #fffdf9;
+      --ink: #1d1a16;
+      --muted: #5e584f;
+      --line: #e4d9c8;
+      --green: #1f7a45;
+      --green-bg: #e7f6ec;
+      --amber: #8a5a12;
+      --amber-bg: #fbf3e0;
+      --red: #8d2b2b;
+      --red-bg: #fdecec;
+      --button: #8a3d22;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      background: var(--bg);
+      color: var(--ink);
+      font-family: "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+    }
+    main {
+      max-width: 1040px;
+      margin: 0 auto;
+      padding: 48px 24px 64px;
+    }
+    h1 {
+      margin: 0 0 12px;
+      font-size: 44px;
+      font-weight: 650;
+      letter-spacing: -0.03em;
+    }
+    .lede {
+      max-width: 720px;
+      margin: 0 0 18px;
+      color: var(--muted);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 16px;
+      line-height: 1.45;
+    }
+    .pill {
+      display: inline-block;
+      margin-bottom: 22px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      background: var(--amber-bg);
+      color: var(--amber);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 13px;
+    }
+    .pill.ready { background: var(--green-bg); color: var(--green); }
+    .pill.error { background: var(--red-bg); color: var(--red); }
+    .grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 18px;
+    }
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      padding: 22px;
+      min-height: 420px;
+    }
+    h2 { margin: 0 0 16px; font-size: 22px; }
+    label {
+      display: block;
+      margin-bottom: 6px;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 13px;
+      color: var(--muted);
+    }
+    textarea, input {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      background: #fff;
+      color: var(--ink);
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 15px;
+    }
+    textarea { min-height: 150px; padding: 12px; resize: vertical; }
+    .fields {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 12px;
+      margin: 14px 0 16px;
+    }
+    input { padding: 10px 12px; }
+    button {
+      border: 0;
+      border-radius: 10px;
+      background: var(--button);
+      color: white;
+      padding: 11px 16px;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 15px;
+      cursor: pointer;
+    }
+    button:disabled { opacity: 0.55; cursor: wait; }
+    .answer {
+      margin: 0 0 18px;
+      font-size: 22px;
+      line-height: 1.35;
+    }
+    .empty, .err {
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      color: var(--muted);
+    }
+    .err { color: var(--red); }
+    dl {
+      display: grid;
+      grid-template-columns: 160px 1fr;
+      gap: 8px 12px;
+      margin: 0;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 14px;
+    }
+    dt { color: var(--muted); }
+    dd { margin: 0; overflow-wrap: anywhere; }
+    @media (max-width: 800px) {
+      .grid, .fields { grid-template-columns: 1fr; }
+      h1 { font-size: 36px; }
+    }
+  </style>
+</head>
+<body>
+  <main>
+    <h1>AccelEP</h1>
+    <p class="lede">The page sends your prompt to the CPU simulator. SimDevice runs SmolLM2-135M: embedding, RMSNorm, RoPE, attention, SiLU, the residual adds, and the vocabulary projection. The reply is the text decoded from the token ids the simulator sampled.</p>
+    <div id="status" class="pill">Simulator starting</div>
+    <div class="grid">
+      <section class="card">
+        <h2>Input</h2>
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt">whats 2+2</textarea>
+        <div class="fields">
+          <div>
+            <label for="max">New tokens</label>
+            <input id="max" type="number" min="1" max="48" value="8">
+          </div>
+          <div>
+            <label for="temperature">Temperature</label>
+            <input id="temperature" type="number" min="0" max="2" step="0.1" value="0">
+          </div>
+          <div>
+            <label for="seed">Seed</label>
+            <input id="seed" type="number" min="0" step="1" value="0">
+          </div>
+        </div>
+        <button id="run" type="button" disabled>Run on the simulator</button>
+      </section>
+      <section class="card">
+        <h2>Output</h2>
+        <p id="answer" class="empty">The reply shows up here.</p>
+        <dl id="stats" hidden>
+          <dt>prompt tokens</dt><dd id="prompt-tokens"></dd>
+          <dt>completion tokens</dt><dd id="completion-tokens"></dd>
+          <dt>token ids</dt><dd id="token-ids"></dd>
+          <dt>matmuls</dt><dd id="matmuls"></dd>
+          <dt>bytes to device</dt><dd id="bytes-device"></dd>
+          <dt>bytes to host</dt><dd id="bytes-host"></dd>
+        </dl>
+      </section>
+    </div>
+  </main>
+  <script>
+    const statusEl = document.querySelector("#status");
+    const run = document.querySelector("#run");
+    const answer = document.querySelector("#answer");
+    const stats = document.querySelector("#stats");
+
+    function setStatus(text, kind) {
+      statusEl.textContent = text;
+      statusEl.className = "pill" + (kind ? " " + kind : "");
+    }
+
+    async function refresh() {
+      try {
+        const response = await fetch("/health");
+        const body = await response.json();
+        if (body.status === "ok") {
+          setStatus("SimDevice ready  ·  " + body.layers + " layers  ·  hidden " + body.hidden + "  ·  vocab " + body.vocab, "ready");
+          run.disabled = false;
+          return true;
+        }
+        if (body.status === "error") {
+          setStatus(body.error || "simulator failed", "error");
+          return true;
+        }
+        setStatus("Loading SmolLM2-135M");
+      } catch (err) {
+        setStatus("Waiting for the server");
+      }
+      return false;
+    }
+
+    async function poll() {
+      const done = await refresh();
+      if (!done) setTimeout(poll, 1000);
+    }
+    poll();
+
+    run.addEventListener("click", async () => {
+      run.disabled = true;
+      answer.className = "empty";
+      answer.textContent = "Running on the simulator…";
+      stats.hidden = true;
+      try {
+        const response = await fetch("/v1/chat/completions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            messages: [{ role: "user", content: document.querySelector("#prompt").value }],
+            max_tokens: Number(document.querySelector("#max").value),
+            temperature: Number(document.querySelector("#temperature").value),
+            seed: Number(document.querySelector("#seed").value),
+            stream: true
+          })
+        });
+        if (!response.ok) {
+          let message = "request failed";
+          try {
+            const failed = await response.json();
+            if (failed.error) message = failed.error;
+          } catch (ignore) {}
+          throw new Error(message);
+        }
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let pending = "";
+        answer.className = "answer";
+        answer.textContent = "";
+        while (true) {
+          const chunk = await reader.read();
+          if (chunk.done) break;
+          pending += decoder.decode(chunk.value, { stream: true });
+          let breakAt = pending.indexOf("\n");
+          while (breakAt >= 0) {
+            const line = pending.slice(0, breakAt).trim();
+            pending = pending.slice(breakAt + 1);
+            if (line) {
+              const msg = JSON.parse(line);
+              if (msg.error) throw new Error(msg.error);
+              if (typeof msg.text === "string") answer.textContent = msg.text;
+              if (Array.isArray(msg.token_ids)) {
+                document.querySelector("#prompt-tokens").textContent = msg.prompt_tokens;
+                document.querySelector("#completion-tokens").textContent = msg.completion_tokens;
+                document.querySelector("#token-ids").textContent = msg.token_ids.join(" ");
+                document.querySelector("#matmuls").textContent = msg.matmuls;
+                document.querySelector("#bytes-device").textContent = msg.bytes_to_device;
+                document.querySelector("#bytes-host").textContent = msg.bytes_to_host;
+                stats.hidden = false;
+              }
+            }
+            breakAt = pending.indexOf("\n");
+          }
+        }
+      } catch (err) {
+        answer.className = "err";
+        answer.textContent = err.message;
+      } finally {
+        run.disabled = statusEl.classList.contains("error");
+      }
+    });
+  </script>
+</body>
+</html>

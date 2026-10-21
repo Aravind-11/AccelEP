@@ -188,13 +188,45 @@ int main() {
     const float logits[] = {1.f, 3.f, 3.f};
     int32_t chosen[] = {-1};
     uint32_t rng = 1u;
-    accel::SimSampleToken(logits, chosen, 0, 3, 0.f, &rng);
+    accel::SimSampleToken(logits, chosen, 0, 3, 0.f, &rng, 2);
     if (chosen[0] != 1) {
       return Fail("Sample");
     }
     chosen[0] = -1;
-    accel::SimSampleToken(logits, chosen, 0, 3, -1.f, &rng);
+    accel::SimSampleToken(logits, chosen, 0, 3, -1.f, &rng, 0);
     if (chosen[0] != 1) {
+      return Fail("Sample");
+    }
+    const float hand[] = {1.f, 3.f, 0.f};
+    uint32_t hand_rng = 1856u;
+    chosen[0] = -1;
+    accel::SimSampleToken(hand, chosen, 0, 3, 1.f, &hand_rng, 2);
+    if (chosen[0] != 0) {
+      return Fail("Sample");
+    }
+    hand_rng = 1856u;
+    chosen[0] = -1;
+    accel::SimSampleToken(hand, chosen, 0, 3, 1.f, &hand_rng, 0);
+    if (chosen[0] != 1) {
+      return Fail("Sample");
+    }
+    hand_rng = 0u;
+    chosen[0] = -1;
+    accel::SimSampleToken(hand, chosen, 0, 3, 1.f, &hand_rng, 0);
+    if (chosen[0] != 0 || hand_rng != 0u) {
+      return Fail("Sample");
+    }
+    float wide[65] = {};
+    uint32_t wide_rng = 1000u;
+    chosen[0] = -1;
+    accel::SimSampleToken(wide, chosen, 0, 65, 1.f, &wide_rng, 65);
+    if (chosen[0] != 4) {
+      return Fail("Sample");
+    }
+    wide_rng = 1000u;
+    chosen[0] = -1;
+    accel::SimSampleToken(wide, chosen, 0, 65, 1.f, &wide_rng, 64);
+    if (chosen[0] != 3) {
       return Fail("Sample");
     }
   } catch (...) {

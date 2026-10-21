@@ -117,12 +117,18 @@ class Device {
   // dest[i] += extra[i].
   virtual void ResidualAdd(DeviceBuffer dest, DeviceBuffer extra, int64_t count) = 0;
 
-  // Writes one int32 to chosen_ids[chosen_index]. temperature <= 0 is argmax.
+  // Writes one int32 to chosen_ids[chosen_index]. temperature <= 0 is argmax
+  // and keeps the earlier id on a tie. top_k <= 0 or top_k >= vocab draws from the whole vocabulary.
+  // A smaller positive top_k keeps at most 64 logits.
   virtual void SampleToken(DeviceBuffer logits, DeviceBuffer chosen_ids, int64_t chosen_index, int64_t vocab,
-                           float temperature, uint32_t* rng_state) = 0;
+                           float temperature, uint32_t* rng_state, int top_k) = 0;
 };
 
 std::unique_ptr<Device> CreateSimDevice();
+
+// Forwards every call to a SimDevice except MatMul, which uses a 32x64x32 panel.
+// Results match ReferenceMatMul bit for bit. The page and the plugin keep CreateSimDevice.
+std::unique_ptr<Device> CreateTiledDevice();
 
 // Process-wide count of device allocations that have not been freed.
 // Destroying a SimDevice does not sweep this count.

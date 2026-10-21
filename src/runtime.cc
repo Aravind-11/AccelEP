@@ -119,6 +119,9 @@ void NextIndex(std::vector<int64_t>* index, const std::vector<int64_t>& shape) {
 }
 
 DeviceBuffer Resolve(Device& device, const Operand& op, OwnedBuffer* uploaded) {
+  if (op.quant) {
+    throw std::invalid_argument("quantized operand has no float buffer");
+  }
   if (op.on_device != nullptr) {
     if (op.host != nullptr) {
       throw std::invalid_argument("an operand needs exactly one of host or device memory");
@@ -265,6 +268,86 @@ void ExecuteFusedImpl(Device& device, const Operand& a, const Operand& b, const 
   const std::vector<int64_t> a_batch(a.shape.begin(), a.shape.end() - 2);
   const std::vector<int64_t> b_batch(b.shape.begin(), b.shape.end() - 2);
   const std::vector<int64_t> out_batch(out_shape.begin(), out_shape.end() - 2);
+
+  if (a.quant || b.quant) {
+    if (config.trans_a || config.trans_b) {
+      throw std::invalid_argument("quantized MatMul does not transpose");
+    }
+    const int64_t out_count = ElementCount(out_shape);
+    if (retain == nullptr && out_count > 0 && out_host == nullptr) {
+      throw std::invalid_argument("missing FusedMatMul output");
+    }
+    OwnedBuffer a_upload;
+    OwnedBuffer b_upload;
+    const float* a_base = nullptr;
+    const float* b_base = nullptr;
+    if (!a.quant) {
+      if (a.on_device != nullptr) {
+        if (a.host != nullptr || a.on_device->shape != a.shape) {
+          throw std::invalid_argument("device operand shape does not match");
+        }
+        a_base = static_cast<const float*>(a.on_device->buffer.data);
+      } else {
+        a_upload = Upload(device, a.host, a.shape);
+        a_base = static_cast<const float*>(a_upload.buffer.data);
+      }
+    }
+    if (!b.quant) {
+      if (b.on_device != nullptr) {
+        if (b.host != nullptr || b.on_device->shape != b.shape) {
+          throw std::invalid_argument("device operand shape does not match");
+        }
+        b_base = static_cast<const float*>(b.on_device->buffer.data);
+      } else {
+        b_upload = Upload(device, b.host, b.shape);
+        b_base = static_cast<const float*>(b_upload.buffer.data);
+      }
+    }
+    OwnedBuffer out;
+    out.device = &device;
+    out.shape = out_shape;
+    out.buffer = device.Allocate(static_cast<size_t>(out_count) * sizeof(float));
+    const int64_t batches = out_batch.empty() ? 1 : ElementCount(out_batch);
+    std::vector<int64_t> index(out_batch.size(), 0);
+    for (int64_t batch = 0; batch < batches; ++batch) {
+      const int64_t a_off = BatchOffset(a_batch, index) * a_rows * a_cols;
+      const int64_t b_off = BatchOffset(b_batch, index) * b_rows * b_cols;
+      const int64_t c_off = batch * m * n;
+      QuantPlane a_plane = a.quant_plane;
+      QuantPlane b_plane = b.quant_plane;
+      if (a.quant) {
+        a_plane.offset += a_off;
+      }
+      if (b.quant) {
+        b_plane.offset += b_off;
+      }
+      float* c_ptr = out_count == 0 ? nullptr : static_cast<float*>(out.buffer.data) + c_off;
+      // The panel stays in MatMulQuantized. It is not copied onto the device.
+      MatMulQuantized(a.quant ? nullptr : a_base + a_off, a.quant ? &a_plane : nullptr,
+                      b.quant ? nullptr : b_base + b_off, b.quant ? &b_plane : nullptr, c_ptr, m, k, n);
+      if (batch + 1 < batches) {
+        NextIndex(&index, out_batch);
+      }
+    }
+    if (out_count > 0 && (config.alpha != 1.f || activation != Activation::None)) {
+      device.GemmEpilogue(out.buffer, out_count, 1, config.alpha, nullptr, {}, 0.f, activation);
+    }
+    NoteActivation(activation);
+    if (residual != nullptr) {
+      OwnedBuffer residual_upload;
+      if (out_count > 0) {
+        const DeviceBuffer residual_buf = Resolve(device, *residual, &residual_upload);
+        device.GemmEpilogue(out.buffer, 1, out_count, 1.f, &residual_buf, std::vector<int64_t>{out_count}, 1.f,
+                            Activation::None);
+      }
+      NoteAddEpilogue();
+    }
+    Deliver(device, &out, out_count, out_host, retain);
+    if (note_matmul) {
+      NoteMatmulOp();
+    }
+    return;
+  }
 
   OwnedBuffer a_upload;
   OwnedBuffer b_upload;

@@ -4,20 +4,20 @@ AccelEP is an ONNX Runtime 1.31 plugin for matrix multiplies, and a CPU simulato
 
 The checked model is [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct). You can try the chat at <https://accelep.vercel.app/>. After the site has been idle, the first reply can take a few seconds while the model loads.
 
-The weight file is bfloat16, about 257 MB, and is left out of git. The loader converts every tensor to float32. A full-size Llama does not fit in 8 GB. The server keeps 512 tokens of context. The checkpoint allows 8192 positions.
+The weight file is bfloat16, about 257 MB, and is left out of git. The loader converts one tensor at a time with the same bfloat16 bit shift it has always used, uploads it, and drops the host copy before the next tensor. A full-size Llama does not fit in 8 GB. Context length is `min(max_position_embeddings, 1 GiB / bytes_per_token)`. This shape uses 71,948 bytes per token, so SmolLM2 keeps 8192 positions and SmolLM-135M-Instruct keeps 2048. A caller that passes `context` still overrides that default.
 
 ## What a chat request does
 
 The browser sends the message and shows the reply. Python writes the chat string and answers HTTP. The C++ library tokenizes, runs the forward pass, samples, and turns the ids back into text.
 
-1. **Chat string.** When the first message is not a system turn, SmolLM2 gets this text, with a newline after `<|im_end|>`:
+1. **Chat string.** The server renders `chat_template` from `tokenizer_config.json`. It accepts only the skeleton both SmolLM files use: one pass over the messages, the system line only when that file's `{% if loop.first %}` block is present, and the assistant header when a reply is requested. Anything else raises. SmolLM2's template contains the system sentence, so a user message still begins with:
 
    ```text
    <|im_start|>system
    You are a helpful AI assistant named SmolLM, trained by Hugging Face<|im_end|>
    ```
 
-   Each message is then `<|im_start|>`, the role, a newline, the text, `<|im_end|>`, and a newline. The string ends with `<|im_start|>assistant` and a newline. `POST /v1/completions` skips this and completes the raw prompt.
+   Each message is then `<|im_start|>`, the role, a newline, the text, `<|im_end|>`, and a newline. The string ends with `<|im_start|>assistant` and a newline. An empty message list does not insert the system line, because that `if` sits inside the `for`. SmolLM-135M's template has no system sentence, so none is added. `POST /v1/completions` skips this and completes the raw prompt.
 
 2. **Tokenize.** `src/bpe.cc` turns the string into token ids. The vocabulary is missing 21 GPT-2 byte symbols. Those bytes are dropped, and the rest of the piece is merged. Encode and decode match the `tokenizers` package.
 
@@ -48,7 +48,7 @@ The hosted chat for "whats 2+2", also 8 tokens at temperature 0, returned "2 + 2
 
 SmolLM2 is hidden 576, 30 layers, 9 heads, 3 key/value heads, head size 64, intermediate 1536, vocab 49152. `rope_theta` is 100000. The MLP is SiLU. The embedding and the vocabulary matrix share one weight.
 
-At startup the host builds the RoPE cosine and sine tables for all 512 positions and uploads them. Embedding and RMSNorm weights keep the file layout. Every matrix, including the vocabulary matrix, is transposed on the host and then uploaded.
+At startup the host builds the RoPE cosine and sine tables for every position in the context and uploads them. Embedding and RMSNorm weights keep the file layout. Every matrix, including the vocabulary matrix, is transposed on the host and then uploaded. The transpose scratch is freed before the next tensor is read.
 
 `LlamaModel::Forward` only calls `SimDevice` methods.
 
@@ -73,7 +73,7 @@ Attention is causal. Query head `h` reads key/value head `h / 3`. Scores are sca
 
 The 211 matrix multiplies are seven per layer, times 30, plus the vocabulary matrix.
 
-`SampleToken` runs after the forward. Temperature 0, and any temperature that is not positive, keeps the largest logit. A tie keeps the earlier id. A positive temperature draws from the softmax with an xorshift generator. Seed 0 starts at `0x6d2b79f5`.
+`SampleToken` runs after the forward. Temperature 0, and any temperature that is not positive, keeps the largest logit. A tie keeps the earlier id. `top_k` is ignored on that path. A positive temperature with `top_k` of 0, or with `top_k` at least the vocabulary size, draws from the full vocabulary with an xorshift generator. `top_k` from 1 to 64 keeps a 64-slot table filled in one pass. The earlier id wins a tie. The exp walk visits those slots in increasing token id. Seed 0 is replaced with `0x6d2b79f5` inside `Generate`, before sampling. `SampleToken` does not reseed a zero state on its own.
 
 ## Serve SmolLM2
 
@@ -91,13 +91,16 @@ python3 -m venv .venv
 PYTHONPATH=. .venv/bin/python -m serve --model models --port 8000
 ```
 
-The server listens on `127.0.0.1:8000`. One lock wraps each completion.
+The server listens on `127.0.0.1:8000`. The model loads on a background thread. `GET /health` returns `{"status":"loading"}` until that finishes, then `ok` with the layer count, hidden size, and vocab size. One lock wraps each completion. `max_tokens` above 48 is rejected with `max_tokens must be at most 48` before the forward. The server default is 16. The page caps the same field at 48.
+
+`stream: true` on either POST returns newline-delimited JSON with `Transfer-Encoding: chunked`. Each intermediate line is `{"text": "..."}`, the stable UTF-8 prefix so far. A trailing U+FFFD is held back until a later token can complete it. The final line has the same fields as the JSON completion, including the ids and the copy counters. The page reads that body with `response.body.getReader()` and paints `#answer`. Detokenizing uses the host `tokenizers` package and does not call back into the model.
 
 | Route | What it does |
 | --- | --- |
-| `GET /health` | Returns `ok`, plus the layer count, hidden size, and vocab size. |
+| `GET /` | Serves the chat page. |
+| `GET /health` | Returns `loading`, then `ok` with the layer count, hidden size, and vocab size. |
 | `POST /v1/completions` | Completes a raw prompt. |
-| `POST /v1/chat/completions` | Builds the SmolLM2 chat string, then completes it. |
+| `POST /v1/chat/completions` | Builds the chat string from the loaded template, then completes it. |
 
 ## Tests
 
@@ -113,17 +116,17 @@ That needs the `models/` files above and a `.venv` with `numpy` and `tokenizers`
    Eight kernels, each on a few hand values: embedding, RMSNorm, RoPE, the cache append, attention, SiLU, the residual add, and sampling. Logits `[1, 3, 3]` at temperature 0 return id 1.
 
 2. `build/test_runtime` prints `runtime tests passed`.
-   Twenty-four checks of the matrix runtime used by the ONNX plugin: MatMul and Gemm shapes, a fused Relu, a residual, transposes, allocation, a recorded call trace, and the copy counters.
+   Twenty-six checks of the matrix runtime used by the ONNX plugin: MatMul and Gemm shapes, a fused Relu, a residual, transposes, allocation, a recorded call trace, and the copy counters. One check builds a second device, `CreateTiledDevice()`, whose matmul panels are 32 by 64 by 32. That scratch is 16,384 bytes, half of this machine's 32 KB L1 data cache. Each output keeps one accumulator and adds products for `k = 0, 1, …`, so the bits match `ReferenceMatMul`. `CreateSimDevice()` is still what the page and the plugin use. Another check multiplies a float activation by an int8 weight inside a 64 by 256 panel. The scale is applied while the panel is filled. The result matches `ReferenceMatMul` of the dequantized floats, including a per-row scale and a scalar scale. A transposed packed weight throws.
 
 3. `tests/test_serve.py` prints `serve tests passed`.
    Five checks:
    - Encode and decode match `tokenizers` on 24 strings, including bytes missing from the vocabulary.
    - One simulator matrix multiply matches NumPy.
    - The Python RMSNorm and RoPE helpers match their formulas. The serving path uses the C++ kernels from step 1.
-   - Greedy chat for "The capital of France is" contains "Paris". Bytes copied back equal the UTF-8 length plus 4 per completion id. Bytes copied in equal 4 per prompt id. One token at temperature 0.8 follows the same rule.
-   - `GET /health`, `POST /v1/chat/completions`, and `POST /v1/completions` return 200. The chat reply contains Paris.
+   - Context is 71,948 bytes per token, so SmolLM2 defaults to 8192 and SmolLM-135M-Instruct to 2048. `context=8` still overrides. The embed float32 CRC is unchanged after the upload. A 4-token prefill of ids `[10, 20, 30, 40]` and the following decode of id 50 match positions 3 and 4 of one independent 5-token NumPy forward, max abs at most `1e-3`. That comparison copies 20 bytes in and nothing back. Greedy chat for "The capital of France is" is `The capital of France is Paris.` with ids `[504, 3575, 282, 4649, 314, 7042, 30, 2]`, 63 bytes back, 140 bytes in, and 1,688 matmuls. The chat string comes from the loaded template. An empty message list is only the assistant header. `max_tokens` 49 raises before a forward. One token at temperature 0.8, with `top_k` left at 0, copies only its text and its id.
+   - `GET /health` is polled until `ok`. `max_tokens` 49 returns 400 with `max_tokens must be at most 48`. A streaming Paris completion is chunked, has no `Content-Length`, and the final line carries the same ids and the same 63/140/1,688 counters. A non-streaming short completion still returns 200.
 
-This Mac printed all three pass lines. The France reply in the table above is the one that run produced. When `models/model.safetensors` is absent, step 3 skips the model and HTTP checks and still prints `serve tests passed`.
+This Mac printed all three pass lines. The France reply in the table above is the one that run produced. The logit check printed max abs `4.20e-5` on the 4-token prefill and `3.58e-5` on the following decode, with argmax 32 and 20. When `models/model.safetensors` is absent, step 3 skips the model and HTTP checks and still prints `serve tests passed`.
 
 ### A second checkpoint
 
@@ -146,17 +149,19 @@ Jupiter is named directly. The other replies talk around the question.
 
 ### What these steps leave open
 
-The kernel checks use one or two elements. The model uses head size 64 and grouped-query attention. The France check looks for one word in one reply. A logit match against an independent forward, and a full prefill compared with one token at a time, are still open.
+The kernel checks use one or two elements. The model uses head size 64 and grouped-query attention. The serve test compares the device logit row with one causal NumPy forward: the 4-token prefill against position 3, and the next decode against position 4. Walking a whole prompt one token at a time, apart from that single decode step, is still open.
 
 The loader accepts a Llama with SiLU, no RoPE scaling, and a Hugging Face BPE tokenizer whose pretokenizer is `Digits` then `ByteLevel`, with a null normalizer, a null post-processor, and byte fallback off. `JackFram/llama-68m` has no `tokenizer.json`. `ModelCloud/tinyllama-15M-stories` sets byte fallback and an `unk_token`, so this loader rejects it.
 
 ## ONNX plugin
 
-The plugin takes float32 MatMul, 2D Gemm, and `com.microsoft.FusedMatMul` when the shapes are static. One leading MatMul batch dimension may still be unknown when the graph is compiled. Softmax, layer norm, and every other op stay on the CPU execution provider.
+The plugin takes float32 MatMul, 2D Gemm, and `com.microsoft.FusedMatMul` when the shapes are static. One leading MatMul batch dimension may still be unknown when the graph is compiled. Softmax stays on the CPU execution provider.
 
 A following Relu stays on the device. So does an opset-20 Gelu when `approximate` is absent or `"none"`. The next matrix in that group reads the activated values from the device. A lone MatMul can add one residual of the same shape. A constant-weight projection leaves that residual on the CPU when the Add feeds more than one node.
 
-A constant int8 `DequantizeLinear` that feeds a float MatMul is uploaded as float32. Other quantizer shapes stay on the CPU.
+A single-consumer opset-23 `RMSNormalization` can stay on the device when its scale is a constant last-axis vector, it has no bias, and its only attributes are `axis` and `epsilon`. Graph resolution also copies the schema default `stash_type` of 1, which is the float sum, and that default still fuses. Any other `stash_type` stays on the CPU. On the prenorm toy, the context MatMul, the residual add, that norm, the MLP, and the closing residual are one kernel. The pre-norm sum stays on the device for the closing add. That graph copies 576 bytes to the device and 192 back, with two residual adds. The attention norm still has two consumers, so it stays on the CPU. The toy decoder still uses `LayerNormalization`, and its counters stay 1,152 bytes to the device and 896 back, with no fused add.
+
+A constant int8 `DequantizeLinear` that feeds one float MatMul stays packed. The multiply dequantizes into a 64 by 256 panel and applies the scale there. A scalar scale uses axis `-1`. A rank-1 scale whose axis is the schema default `1` stays on the CPU, and so do block scales and uint8. The panel is not a second copy onto the device. This is not Q4_K, and it does not shrink the SmolLM weights. A request to transpose a packed int8 weight throws.
 
 | Op | Domain | What is accepted |
 | --- | --- | --- |
@@ -177,7 +182,7 @@ make test
 
 `make venv` installs `onnxruntime==1.31.0` and `onnx==1.21.0` into `/tmp/accel-venv`. A good run prints `runtime tests passed` and `ep tests passed`. `make bench` is separate. `make clean` removes `build/`.
 
-On this Mac the linker rejects `-z`, so `make build/libaccel_ep.so` stops there. `make simlib` still builds `build/libaccel_sim.dylib` for the Llama server. Run `make clean` before a Linux plugin build, so the Mac objects are not reused.
+On this Mac the linker rejects `-z`, so `make build/libaccel_ep.so` stops there. `src/ep.cc` does compile to `build/ep.o` with the same warning flags. The Python plugin tests were not run here. `make simlib` still builds `build/libaccel_sim.dylib` for the Llama server. Run `make clean` before a Linux plugin build, so the Mac objects are not reused.
 
 ```python
 import onnxruntime as ort

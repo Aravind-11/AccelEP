@@ -20,6 +20,7 @@
 #include <stdexcept>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace accel {
 namespace {
@@ -313,7 +314,7 @@ class SimDevice final : public Device {
   }
 
   void SampleToken(DeviceBuffer logits, DeviceBuffer chosen_ids, int64_t chosen_index, int64_t vocab,
-                   float temperature, uint32_t* rng_state) override {
+                   float temperature, uint32_t* rng_state, int top_k) override {
     if (vocab <= 0 || chosen_index < 0) {
       throw std::invalid_argument("SampleToken is out of range");
     }
@@ -323,7 +324,7 @@ class SimDevice final : public Device {
     RequireBytes(logits, CheckedBytes(vocab, 1), "SampleToken logits are out of range");
     RequireBytes(chosen_ids, CheckedIntBytes(CheckedSpan(chosen_index, 1)), "SampleToken ids are out of range");
     SimSampleToken(static_cast<const float*>(logits.data), static_cast<int32_t*>(chosen_ids.data), chosen_index, vocab,
-                   temperature, rng_state);
+                   temperature, rng_state, top_k);
   }
 
  private:
@@ -400,6 +401,208 @@ void ReferenceMatMul(const float* a, const float* b, float* c, int64_t m, int64_
   }
 }
 
+namespace {
+
+float DequantAt(const QuantPlane& plane, int64_t index) {
+  const int rank = static_cast<int>(plane.shape.size());
+  float scale = plane.scale[0];
+  float zero = 0.f;
+  if (plane.axis >= 0) {
+    int64_t stride = 1;
+    for (int dim = rank - 1; dim > plane.axis; --dim) {
+      stride *= plane.shape[static_cast<size_t>(dim)];
+    }
+    const int64_t coord = (index / stride) % plane.shape[static_cast<size_t>(plane.axis)];
+    scale = plane.scale[coord];
+    if (plane.zero != nullptr) {
+      zero = static_cast<float>(plane.zero[coord]);
+    }
+  } else if (plane.zero != nullptr) {
+    zero = static_cast<float>(plane.zero[0]);
+  }
+  return (static_cast<float>(plane.q[index]) - zero) * scale;
+}
+
+class TiledDevice final : public Device {
+ public:
+  explicit TiledDevice(std::unique_ptr<Device> inner) : inner_(std::move(inner)) {}
+
+  const char* Name() const override { return "tiled"; }
+
+  DeviceBuffer Allocate(size_t bytes) override { return inner_->Allocate(bytes); }
+  void Free(DeviceBuffer buffer) override { inner_->Free(buffer); }
+  void CopyHostToDevice(DeviceBuffer dst, const void* src, size_t bytes) override {
+    inner_->CopyHostToDevice(dst, src, bytes);
+  }
+  void CopyDeviceToHost(void* dst, DeviceBuffer src, size_t bytes) override {
+    inner_->CopyDeviceToHost(dst, src, bytes);
+  }
+
+  void MatMul(DeviceBuffer a, DeviceBuffer b, DeviceBuffer c, int64_t m, int64_t k, int64_t n) override {
+    if (m < 0 || k < 0 || n < 0) {
+      throw std::invalid_argument("TiledDevice MatMul is out of range");
+    }
+    auto* A = static_cast<const float*>(a.data);
+    auto* B = static_cast<const float*>(b.data);
+    auto* C = static_cast<float*>(c.data);
+    // A tile is 32*64 and B tile is 64*32: 16384 bytes, half of a 32 KB L1.
+    constexpr int kTm = 32;
+    constexpr int kTk = 64;
+    constexpr int kTn = 32;
+    std::vector<float> a_tile(static_cast<size_t>(kTm) * kTk);
+    std::vector<float> b_tile(static_cast<size_t>(kTk) * kTn);
+    for (int64_t i0 = 0; i0 < m; i0 += kTm) {
+      const int64_t mr = std::min(static_cast<int64_t>(kTm), m - i0);
+      for (int64_t j0 = 0; j0 < n; j0 += kTn) {
+        const int64_t nr = std::min(static_cast<int64_t>(kTn), n - j0);
+        float acc[kTm][kTn];
+        for (int64_t ii = 0; ii < mr; ++ii) {
+          for (int64_t jj = 0; jj < nr; ++jj) {
+            acc[ii][jj] = 0.f;
+          }
+        }
+        for (int64_t k0 = 0; k0 < k; k0 += kTk) {
+          const int64_t kr = std::min(static_cast<int64_t>(kTk), k - k0);
+          for (int64_t ii = 0; ii < mr; ++ii) {
+            for (int64_t kk = 0; kk < kr; ++kk) {
+              a_tile[static_cast<size_t>(ii) * kTk + static_cast<size_t>(kk)] = A[(i0 + ii) * k + (k0 + kk)];
+            }
+          }
+          for (int64_t kk = 0; kk < kr; ++kk) {
+            const float* b_row = B + (k0 + kk) * n + j0;
+            float* tile_row = b_tile.data() + static_cast<size_t>(kk) * kTn;
+            for (int64_t jj = 0; jj < nr; ++jj) {
+              tile_row[jj] = b_row[jj];
+            }
+          }
+          for (int64_t ii = 0; ii < mr; ++ii) {
+            for (int64_t kk = 0; kk < kr; ++kk) {
+              const float aik = a_tile[static_cast<size_t>(ii) * kTk + static_cast<size_t>(kk)];
+              const float* brow = b_tile.data() + static_cast<size_t>(kk) * kTn;
+              for (int64_t jj = 0; jj < nr; ++jj) {
+                acc[ii][jj] = acc[ii][jj] + aik * brow[jj];
+              }
+            }
+          }
+        }
+        for (int64_t ii = 0; ii < mr; ++ii) {
+          float* c_row = C + (i0 + ii) * n + j0;
+          for (int64_t jj = 0; jj < nr; ++jj) {
+            c_row[jj] = acc[ii][jj];
+          }
+        }
+      }
+    }
+    NoteKernelMatmul();
+  }
+
+  void Transpose(DeviceBuffer src, DeviceBuffer dst, int64_t rows, int64_t cols) override {
+    inner_->Transpose(src, dst, rows, cols);
+  }
+  void GemmEpilogue(DeviceBuffer c, int64_t m, int64_t n, float alpha, const DeviceBuffer* bias,
+                    const std::vector<int64_t>& bias_shape, float beta, Activation activation) override {
+    inner_->GemmEpilogue(c, m, n, alpha, bias, bias_shape, beta, activation);
+  }
+  void Embedding(DeviceBuffer ids, int64_t id_offset, DeviceBuffer table, DeviceBuffer out, int64_t seq, int64_t hidden,
+                 int64_t vocab) override {
+    inner_->Embedding(ids, id_offset, table, out, seq, hidden, vocab);
+  }
+  void RmsNorm(DeviceBuffer x, DeviceBuffer weight, DeviceBuffer y, int64_t rows, int64_t dim, float eps,
+               int64_t row_offset) override {
+    inner_->RmsNorm(x, weight, y, rows, dim, eps, row_offset);
+  }
+  void Rope(DeviceBuffer states, DeviceBuffer cos_table, DeviceBuffer sin_table, int64_t seq, int64_t n_heads,
+            int64_t head_dim, int64_t position) override {
+    inner_->Rope(states, cos_table, sin_table, seq, n_heads, head_dim, position);
+  }
+  void AppendCache(DeviceBuffer src, DeviceBuffer cache, int64_t seq, int64_t position, int64_t n_heads,
+                   int64_t head_dim) override {
+    inner_->AppendCache(src, cache, seq, position, n_heads, head_dim);
+  }
+  void Attention(DeviceBuffer q, DeviceBuffer k, DeviceBuffer v, DeviceBuffer scores, DeviceBuffer out, int64_t seq,
+                 int64_t position, int64_t heads, int64_t kv_heads, int64_t head_dim) override {
+    inner_->Attention(q, k, v, scores, out, seq, position, heads, kv_heads, head_dim);
+  }
+  void SiluMul(DeviceBuffer gate, DeviceBuffer up, int64_t count) override { inner_->SiluMul(gate, up, count); }
+  void ResidualAdd(DeviceBuffer dest, DeviceBuffer extra, int64_t count) override {
+    inner_->ResidualAdd(dest, extra, count);
+  }
+  void SampleToken(DeviceBuffer logits, DeviceBuffer chosen_ids, int64_t chosen_index, int64_t vocab,
+                   float temperature, uint32_t* rng_state, int top_k) override {
+    inner_->SampleToken(logits, chosen_ids, chosen_index, vocab, temperature, rng_state, top_k);
+  }
+
+ private:
+  std::unique_ptr<Device> inner_;
+};
+
+}  // namespace
+
+void MatMulQuantized(const float* a, const QuantPlane* a_quant, const float* b, const QuantPlane* b_quant, float* c,
+                     int64_t m, int64_t k, int64_t n) {
+  if (m < 0 || k < 0 || n < 0 || (m > 0 && n > 0 && c == nullptr)) {
+    throw std::invalid_argument("quantized MatMul is out of range");
+  }
+  if ((a == nullptr && a_quant == nullptr && m * k != 0) || (b == nullptr && b_quant == nullptr && k * n != 0)) {
+    throw std::invalid_argument("quantized MatMul is missing an operand");
+  }
+  std::vector<float> panel(static_cast<size_t>(kKc) * static_cast<size_t>(kNc));
+  for (int64_t mc = 0; mc < m; mc += kMc) {
+    const int64_t m_end = std::min(mc + static_cast<int64_t>(kMc), m);
+    for (int64_t nc = 0; nc < n; nc += kNc) {
+      const int64_t n_end = std::min(nc + static_cast<int64_t>(kNc), n);
+      const int64_t n_tile = n_end - nc;
+      for (int64_t i0 = mc; i0 < m_end; i0 += kMr) {
+        const int64_t mr = std::min(static_cast<int64_t>(kMr), m_end - i0);
+        for (int64_t j0 = nc; j0 < n_end; j0 += kNr) {
+          const int64_t nr = std::min(static_cast<int64_t>(kNr), n_end - j0);
+          float acc[kMr][kNr];
+          for (int ii = 0; ii < kMr; ++ii) {
+            for (int jj = 0; jj < kNr; ++jj) {
+              acc[ii][jj] = 0.f;
+            }
+          }
+          for (int64_t pc = 0; pc < k; pc += kKc) {
+            const int64_t kc = std::min(static_cast<int64_t>(kKc), k - pc);
+            if (b_quant != nullptr) {
+              for (int64_t kk = 0; kk < kc; ++kk) {
+                for (int64_t j = 0; j < n_tile; ++j) {
+                  panel[static_cast<size_t>(kk) * kNc + static_cast<size_t>(j)] =
+                      DequantAt(*b_quant, b_quant->offset + (pc + kk) * n + (nc + j));
+                }
+              }
+            }
+            for (int64_t ii = 0; ii < mr; ++ii) {
+              for (int64_t kk = 0; kk < kc; ++kk) {
+                const float aik = a_quant != nullptr
+                                      ? DequantAt(*a_quant, a_quant->offset + (i0 + ii) * k + (pc + kk))
+                                      : a[(i0 + ii) * k + (pc + kk)];
+                const float* b_row = b_quant != nullptr ? panel.data() + static_cast<size_t>(kk) * kNc + (j0 - nc)
+                                                        : b + (pc + kk) * n + j0;
+                for (int64_t jj = 0; jj < nr; ++jj) {
+                  const float prod = aik * b_row[jj];
+                  acc[ii][jj] = acc[ii][jj] + prod;
+                }
+              }
+            }
+          }
+          for (int64_t ii = 0; ii < mr; ++ii) {
+            float* c_row = c + (i0 + ii) * n + j0;
+            for (int64_t jj = 0; jj < nr; ++jj) {
+              c_row[jj] = acc[ii][jj];
+            }
+          }
+        }
+      }
+    }
+  }
+  g_packed_calls.fetch_add(1, std::memory_order_relaxed);
+  g_packed_trips.fetch_add(k, std::memory_order_relaxed);
+  NoteKernelMatmul();
+}
+
 std::unique_ptr<Device> CreateSimDevice() { return std::make_unique<SimDevice>(); }
+
+std::unique_ptr<Device> CreateTiledDevice() { return std::make_unique<TiledDevice>(CreateSimDevice()); }
 
 }  // namespace accel

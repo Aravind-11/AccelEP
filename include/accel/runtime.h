@@ -66,10 +66,23 @@ uint64_t ConstantTouchId(int64_t index);
 uint64_t ConstantTouchAddress(int64_t index);
 uint64_t ConstantTouchBytes(int64_t index);
 
+// Constant int8 weight kept packed. axis < 0 is one scale for the whole tensor.
+// `q`, `scale`, and `zero` stay on the device. `zero` is null when the op has none.
+struct QuantPlane {
+  const int8_t* q = nullptr;
+  const float* scale = nullptr;
+  const int8_t* zero = nullptr;
+  std::vector<int64_t> shape;
+  int64_t axis = -1;
+  int64_t offset = 0;
+};
+
 struct Operand {
   const float* host = nullptr;
   const OwnedBuffer* on_device = nullptr;
   std::vector<int64_t> shape;
+  bool quant = false;
+  QuantPlane quant_plane{};
 };
 
 struct GemmConfig {
@@ -104,6 +117,12 @@ OwnedBuffer Upload(Device& device, const float* data, const std::vector<int64_t>
 // Swaps the last two dimensions of a constant weight into a second buffer.
 // One Device::Transpose per leading batch. Does not fold alpha.
 void PretransposeLastTwo(Device& device, const OwnedBuffer& src, OwnedBuffer* dst);
+
+// Same product order as SimDevice::MatMul. A null plane reads the float pointer.
+// A right-hand plane is dequantized into one 64x256 float panel at a time.
+// Notes one kernel matmul and one packed-GEMM probe, like Device::MatMul.
+void MatMulQuantized(const float* a, const QuantPlane* a_quant, const float* b, const QuantPlane* b_quant, float* c,
+                     int64_t m, int64_t k, int64_t n);
 
 // Writes the MatMul result into `out_host`, or moves it into `retain` and skips
 // the host copy. `residual`, when set, is added elementwise after the activation.
