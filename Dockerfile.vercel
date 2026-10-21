@@ -1,0 +1,25 @@
+FROM python:3.12-bookworm
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends g++ make ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+COPY Makefile Makefile
+COPY include include
+COPY src src
+COPY serve serve
+
+RUN make simlib \
+    && pip install --no-cache-dir "numpy==2.2.6" "tokenizers==0.22.2" \
+    && mkdir -p models/SmolLM2-360M-Instruct \
+    && curl -fL --retry 5 --retry-delay 2 -o models/SmolLM2-360M-Instruct/config.json https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/config.json \
+    && curl -fL --retry 5 --retry-delay 2 -o models/SmolLM2-360M-Instruct/tokenizer.json https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/tokenizer.json \
+    && curl -fL --retry 5 --retry-delay 2 -o models/SmolLM2-360M-Instruct/tokenizer_config.json https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/tokenizer_config.json \
+    && curl -fL --retry 5 --retry-delay 2 -o models/SmolLM2-360M-Instruct/model.safetensors https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct/resolve/main/model.safetensors
+
+ENV PYTHONPATH=/app
+ENV PYTHONUNBUFFERED=1
+EXPOSE 8000
+# 1024 positions keeps the 1.56 GB float32 weights plus the dense buffers under a 2 GB container.
+CMD ["sh", "-c", "python -m serve --model models/SmolLM2-360M-Instruct --context 1024 --host 0.0.0.0 --port ${PORT:-8000}"]

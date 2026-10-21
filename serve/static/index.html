@@ -47,6 +47,23 @@
       font-size: 16px;
       line-height: 1.45;
     }
+    .objective {
+      margin: 0 0 22px;
+      padding: 18px 20px 6px;
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      font-family: "Avenir Next", "Segoe UI", sans-serif;
+      font-size: 15px;
+      line-height: 1.5;
+    }
+    .objective h2 {
+      margin: 0 0 12px;
+      font-family: "Iowan Old Style", Palatino, "Palatino Linotype", Georgia, serif;
+      font-size: 22px;
+    }
+    .objective p { margin: 0 0 12px; }
+    .objective strong { font-weight: 650; }
     .pill {
       display: inline-block;
       margin-bottom: 22px;
@@ -125,6 +142,7 @@
       font-family: "Avenir Next", "Segoe UI", sans-serif;
       font-size: 14px;
     }
+    dl[hidden] { display: none; }
     dt { color: var(--muted); }
     dd { margin: 0; overflow-wrap: anywhere; }
     @media (max-width: 800px) {
@@ -136,7 +154,14 @@
 <body>
   <main>
     <h1>AccelEP</h1>
-    <p class="lede">The page sends your prompt to the CPU simulator. SimDevice runs SmolLM2-135M: embedding, RMSNorm, RoPE, attention, SiLU, the residual adds, and the vocabulary projection. The reply is the text decoded from the token ids the simulator sampled.</p>
+    <p class="lede">The primary objective is to check accelerator software before the chip exists. This page runs one small Llama on that stand-in, on the CPU.</p>
+    <section class="objective">
+      <h2>Primary objective</h2>
+      <p>A model is a list of math steps. ONNX is the file format for that list. ONNX Runtime reads the file and asks each execution provider which steps it can take. Claimed steps go to that provider. The rest stay on the CPU. That split is the graph partition.</p>
+      <p>AccelEP is the provider for an accelerator that is not on this machine. It claims matrix multiplies, a following ReLU or exact GELU, one residual, and a constant int8 weight that stays packed until the multiply. There is no chip. Behind the provider is a C++ device with its own heap. The device runs on the CPU. A match means Runtime handed over the steps you claimed, the fused steps agree with a reference, and a call log can show the order and the sizes.</p>
+      <p>This chat does not call that plugin. The host builds the prompt string. SimDevice runs the loaded SmolLM checkpoint: embedding, RMSNorm, RoPE, attention, SiLU, the residual adds, and the vocabulary projection. The reply is the text decoded from the token ids the simulator sampled. Temperature is applied after those scores exist, when the next token is chosen.</p>
+      <p>Agreement here means the software and the reference math agree. A real chip can add in a different order and round differently. That comparison is mmaprobe's job. This page does not apply a tensor-core rounding model.</p>
+    </section>
     <div id="status" class="pill">Simulator starting</div>
     <div class="grid">
       <section class="card">
@@ -189,7 +214,7 @@
         const response = await fetch("/health");
         const body = await response.json();
         if (body.status === "ok") {
-          setStatus("SimDevice ready  ·  " + body.layers + " layers  ·  hidden " + body.hidden + "  ·  vocab " + body.vocab, "ready");
+          setStatus("SimDevice ready  ·  " + (body.model || "model") + "  ·  " + body.layers + " layers  ·  hidden " + body.hidden + "  ·  vocab " + body.vocab, "ready");
           run.disabled = false;
           return true;
         }
@@ -197,7 +222,7 @@
           setStatus(body.error || "simulator failed", "error");
           return true;
         }
-        setStatus("Loading SmolLM2-135M");
+        setStatus("Loading " + (body.model || "the checkpoint"));
       } catch (err) {
         setStatus("Waiting for the server");
       }

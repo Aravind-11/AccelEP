@@ -69,9 +69,9 @@ def stable_text(tokenizer, token_ids):
 
 
 class Engine:
-    def __init__(self, model_dir):
+    def __init__(self, model_dir, context=None):
         model_dir = Path(model_dir)
-        self.model = Llama(model_dir)
+        self.model = Llama(model_dir, context=context)
         self.eos_id = self.model.eos_id
         with open(model_dir / "tokenizer_config.json", encoding="utf-8") as handle:
             config = json.load(handle)

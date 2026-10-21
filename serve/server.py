@@ -54,15 +54,17 @@ def make_handler(holder):
                 return
             engine = holder["engine"]
             if engine is None:
-                self._send(200, {"status": "loading"})
+                self._send(200, {"status": "loading", "model": holder["model"]})
                 return
             self._send(
                 200,
                 {
                     "status": "ok",
+                    "model": holder["model"],
                     "layers": engine.model.layers,
                     "hidden": engine.model.hidden,
                     "vocab": engine.model.vocab,
+                    "context": engine.model.context,
                 },
             )
 
@@ -177,13 +179,13 @@ def make_handler(holder):
     return Handler
 
 
-def serve(model_dir, host, port):
-    holder = {"engine": None, "error": None}
+def serve(model_dir, host, port, context=None):
+    holder = {"engine": None, "error": None, "model": Path(model_dir).name}
 
     def load():
         try:
-            holder["engine"] = Engine(model_dir)
-            print("simulator ready", "context", holder["engine"].model.context)
+            holder["engine"] = Engine(model_dir, context=context)
+            print("simulator ready", "model", holder["model"], "context", holder["engine"].model.context)
         except Exception as exc:
             holder["error"] = str(exc)
             print(f"simulator failed: {exc}")

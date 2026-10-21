@@ -1,8 +1,29 @@
 # AccelEP
 
-AccelEP is an ONNX Runtime 1.31 plugin for matrix multiplies, and a CPU simulator that serves a small Llama. `SimDevice` is a heap in this process. The model calls each kernel by name. The simulator runs on the CPU. A hardware backend can replace the kernels and keep the same calls.
+AccelEP is an ONNX Runtime 1.31 execution provider for a pretend accelerator, and a CPU simulator that serves a small Llama. The primary objective is to check that software before the chip exists, or when the chip is not on this machine.
 
-The checked model is [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct). You can try the chat at <https://accelep.vercel.app/>. After the site has been idle, the first reply can take a few seconds while the model loads.
+You can try the chat at <https://accelep.vercel.app/>. After the site has been idle, the first reply can take a few seconds while the model loads.
+
+## Primary objective
+
+A model is a recipe: a list of steps such as "multiply these matrices, add, apply ReLU." ONNX is the file format for that recipe. ONNX Runtime reads the file and carries out each step. An accelerator is hardware that takes certain steps, mostly large matrix multiplies. An execution provider is how Runtime hands work to one piece of hardware. Runtime asks each provider which steps it can take. Claimed steps go to that provider. The rest stay on the CPU. That split is the graph partition.
+
+AccelEP is the provider for an accelerator that is not there. It plugs into Runtime the way a GPU provider would. It claims static float32 MatMul, 2D Gemm, and `com.microsoft.FusedMatMul`. A following Relu stays with the matrix, and so does an exact opset-20 Gelu. One same-shape residual can stay, and a single-consumer opset-23 RMSNormalization can stay. A constant int8 weight stays packed, and the multiply dequantizes one panel at a time. There is no chip. `SimDevice` is the stand-in: a heap and named kernels in C++, running on the CPU. A hardware backend can replace those kernels and keep the same calls.
+
+The stand-in is for the questions you can answer before the hardware exists:
+
+- Does the provider register, and does Runtime hand it the steps it claimed?
+- Does fusion leave the activation on the device, and does the packed int8 path match the dequantized float32 product?
+- Which calls ran, in what order, and with what sizes? The recording device logs that.
+- Does the output match a trusted reference? Plugin tests compare with ONNX Runtime's CPU provider at `rtol=1e-5` and `atol=1e-5`. The SmolLM check compares the device logit row with an independent NumPy forward. On the checked 4-token prefill the max abs difference was `4.20e-5`. On the following decode it was `3.58e-5`.
+
+Runtime's own CPU provider runs the same recipe on the CPU and stops there. AccelEP hands the claimed steps to the stand-in. Each product is a multiply followed by an add, in a fixed `k` order. The path is slower. What you get is a reproducible account of what an accelerator-shaped device was asked to do, and whether that account matches the reference.
+
+The chat is a second program on the same device. The page does not load an ONNX file and does not call the plugin. The host builds the chat string. The simulator tokenizes it, runs the forward pass, picks the next token, and detokenizes. Temperature is applied in that choice, after the scores exist. It does not change the forward pass.
+
+A match shows that the software and the reference math agree. It does not show that a real chip returns the same numbers. A chip can add in a different order and round differently. That comparison is what [mmaprobe](mmaprobe/README.md) is for. AccelEP does not apply an `mma.sync` rounding model. The mmaprobe tree in this repo records no silicon result.
+
+The checked chat model is [SmolLM2-135M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-135M-Instruct).
 
 The weight file is bfloat16, about 257 MB, and is left out of git. The loader converts one tensor at a time with the same bfloat16 bit shift it has always used, uploads it, and drops the host copy before the next tensor. A full-size Llama does not fit in 8 GB. Context length is `min(max_position_embeddings, 1 GiB / bytes_per_token)`. This shape uses 71,948 bytes per token, so SmolLM2 keeps 8192 positions and SmolLM-135M-Instruct keeps 2048. A caller that passes `context` still overrides that default.
 
@@ -88,17 +109,19 @@ Put these files in `models/`. They are left out of the git tree.
 make simlib
 python3 -m venv .venv
 .venv/bin/pip install numpy tokenizers
-PYTHONPATH=. .venv/bin/python -m serve --model models --port 8000
+PYTHONPATH=. .venv/bin/python -m serve --port 8000
 ```
 
-The server listens on `127.0.0.1:8000`. The model loads on a background thread. `GET /health` returns `{"status":"loading"}` until that finishes, then `ok` with the layer count, hidden size, and vocab size. One lock wraps each completion. `max_tokens` above 48 is rejected with `max_tokens must be at most 48` before the forward. The server default is 16. The page caps the same field at 48.
+`python -m serve` loads [SmolLM2-360M-Instruct](https://huggingface.co/HuggingFaceTB/SmolLM2-360M-Instruct) from `models/SmolLM2-360M-Instruct/`. That checkpoint is Llama-shaped, with the same chat template as SmolLM2-135M. It has 32 layers, hidden size 960, and 15 query heads. The float32 weights are about 1.56 GB. The 1 GiB buffer budget still leaves 8192 positions, so a resident model is about 2.5 GB. Pass `--model models` to serve the checked 135M checkpoint instead. Pass `--context` to shorten the cache. A 2 GB container should use `--context 1024`, which keeps the weights and the dense buffers under that limit.
+
+The server listens on `127.0.0.1:8000`. The model loads on a background thread. `GET /health` returns `{"status":"loading"}` until that finishes, then `ok` with the model name, layer count, hidden size, vocab size, and context length. One lock wraps each completion. `max_tokens` above 48 is rejected with `max_tokens must be at most 48` before the forward. The server default is 16. The page caps the same field at 48.
 
 `stream: true` on either POST returns newline-delimited JSON with `Transfer-Encoding: chunked`. Each intermediate line is `{"text": "..."}`, the stable UTF-8 prefix so far. A trailing U+FFFD is held back until a later token can complete it. The final line has the same fields as the JSON completion, including the ids and the copy counters. The page reads that body with `response.body.getReader()` and paints `#answer`. Detokenizing uses the host `tokenizers` package and does not call back into the model.
 
 | Route | What it does |
 | --- | --- |
 | `GET /` | Serves the chat page. |
-| `GET /health` | Returns `loading`, then `ok` with the layer count, hidden size, and vocab size. |
+| `GET /health` | Returns `loading`, then `ok` with the model name, layer count, hidden size, vocab size, and context length. |
 | `POST /v1/completions` | Completes a raw prompt. |
 | `POST /v1/chat/completions` | Builds the chat string from the loaded template, then completes it. |
 
